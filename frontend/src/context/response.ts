@@ -1,6 +1,6 @@
 export async function getGeminiResponse(userMessage: string, history: { role: string, text: string }[]) {
   try {
-    const response = await fetch("http://api.qikkspace.com/api/gemini/chat", {
+    const response = await fetch("https://api.qikkspace.com/api/gemini/chat", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
