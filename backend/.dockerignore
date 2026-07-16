@@ -1,0 +1,22 @@
+# Virtual environments
+ai-caller-env/
+venv/
+env/
+.venv/
+venv_wsl/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment variables
+.env
+
+# Git
+.git/
+.gitignore
+
+# Docker
+docker-compose.yml
+Dockerfile
