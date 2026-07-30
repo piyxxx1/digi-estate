@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Users, Building2, PhoneCall, Sparkles } from 'lucide-react';
+import { Users, Briefcase, PhoneCall, Sparkles } from 'lucide-react';
 import type { Lead, Property, CallLog } from '../types';
 
 interface DashboardTabProps {
@@ -96,7 +96,7 @@ export function DashboardTab({ currentUser, refreshTrigger, onCallLead }: Dashbo
           Welcome back, {currentUser.business_name}
         </h2>
         <p style={{ fontSize: '0.9rem', color: 'var(--text-secondary)', margin: '4px 0 0' }}>
-          Here's an overview of your real estate AI operations.
+          Here's an overview of your AI sales & call operations.
         </p>
       </div>
 
@@ -104,9 +104,9 @@ export function DashboardTab({ currentUser, refreshTrigger, onCallLead }: Dashbo
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '16px' }}>
         {[
           { icon: <Users size={20} />, title: 'Total Leads', val: leads.length, sub: '+18% this month', color: 'var(--primary)', onClick: () => navigate('/leads') },
-          { icon: <Building2 size={20} />, title: 'Properties', val: properties.length, sub: 'Sequenced portfolio', color: 'var(--accent-green, #36b37e)', onClick: () => navigate('/properties') },
+          { icon: <Briefcase size={20} />, title: 'Products & Listings', val: properties.length, sub: 'Managed items', color: 'var(--accent-green, #36b37e)', onClick: () => navigate('/properties') },
           { icon: <PhoneCall size={20} />, title: 'AI Voice Calls', val: callLogs.length, sub: '98% connection rate', color: '#6554c0', onClick: () => navigate('/calls') },
-          { icon: <Sparkles size={20} />, title: 'Site Visits', val: siteVisitsCount, sub: 'High intent rating', color: '#ff991f' },
+          { icon: <Sparkles size={20} />, title: 'Scheduled Demos', val: siteVisitsCount, sub: 'High intent rating', color: '#ff991f' },
         ].map((c, i) => (
           <div key={i} onClick={c.onClick} style={{ 
             background: 'var(--bg-surface)', 

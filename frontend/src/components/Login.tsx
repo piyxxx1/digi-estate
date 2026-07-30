@@ -3,9 +3,10 @@ import './Login.css';
 
 interface LoginProps {
   onLogin: (user: { user_id: string; business_name: string }) => void;
+  onBackToLanding: () => void;
 }
 
-export function Login({ onLogin }: LoginProps) {
+export function Login({ onLogin, onBackToLanding }: LoginProps) {
   const [userId, setUserId] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
@@ -79,12 +80,13 @@ export function Login({ onLogin }: LoginProps) {
               autoComplete="current-password"
             />
           </div>
-          <button type="submit" className="btn-submit login-btn" disabled={loading}>
+          <button type="submit" className="login-btn" disabled={loading}>
             {loading ? "Logging in..." : "Login"}
           </button>
-          <p className="login-toggle" style={{ textAlign: 'center', color: 'var(--text-muted, #888)', fontSize: '0.85rem', marginTop: '1rem' }}>
-            Contact your administrator to get access.
-          </p>
+          
+          <button type="button" className="back-to-landing-btn" onClick={onBackToLanding}>
+            &larr; Back to Product Page
+          </button>
         </form>
       </div>
     </div>

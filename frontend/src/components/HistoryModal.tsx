@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { X, History, ChevronRight, ArrowLeft, Calendar } from 'lucide-react';
-import type { Lead, Message } from '../types';
+import type { Lead } from '../types';
 
 interface HistoryModalProps {
   lead: Lead;

@@ -1,5 +1,5 @@
 import { NavLink } from 'react-router-dom';
-import { LayoutDashboard, Building2, Users, PhoneCall, UserCircle, LogOut } from 'lucide-react';
+import { LayoutDashboard, Briefcase, Users, PhoneCall, UserCircle, LogOut } from 'lucide-react';
 
 interface SidebarProps {
   businessName?: string;
@@ -18,8 +18,8 @@ export function Sidebar({ businessName, onLogout }: SidebarProps) {
   return (
     <aside className="crm-sidebar">
       <div className="crm-sidebar-logo">
-        <Building2 className="crm-logo-icon" />
-        <h1>Digi-Estate CRM</h1>
+        <PhoneCall className="crm-logo-icon" />
+        <h1>DigiCRM</h1>
       </div>
 
       <nav className="crm-menu">
@@ -36,8 +36,8 @@ export function Sidebar({ businessName, onLogout }: SidebarProps) {
           to="/properties"
           className={({ isActive }) => `crm-menu-item ${isActive ? 'active' : ''}`}
         >
-          <Building2 size={18} />
-          <span>Properties</span>
+          <Briefcase size={18} />
+          <span>Products & Listings</span>
         </NavLink>
 
         <NavLink

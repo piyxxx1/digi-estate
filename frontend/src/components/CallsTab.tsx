@@ -2,9 +2,6 @@ import { useState, useEffect, useCallback } from 'react';
 import { 
   PhoneIncoming, 
   PhoneOutgoing, 
-  ChevronDown, 
-  ChevronUp, 
-  MessageSquare, 
   Clock
 } from 'lucide-react';
 import type { CallLog } from '../types';

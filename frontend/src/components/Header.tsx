@@ -21,7 +21,7 @@ export function Header({ searchQuery, setSearchQuery }: HeaderProps) {
       case '/calls':
         return 'AI Call Center Analytics';
       default:
-        return 'Digi-Estate CRM';
+        return 'DigiCRM';
     }
   };
 

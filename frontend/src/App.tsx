@@ -9,6 +9,7 @@ import { CallsTab } from './components/CallsTab';
 import { DialerModal } from './components/DialerModal';
 import { Login } from './components/Login';
 import { ProfileTab } from './components/ProfileTab';
+import { LandingPage } from './components/LandingPage';
 import type { Lead } from './types';
 import './App.css';
 
@@ -17,6 +18,7 @@ function App() {
     const savedUser = localStorage.getItem('user');
     return savedUser ? JSON.parse(savedUser) : null;
   });
+  const [showLogin, setShowLogin] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
 
   // Dialer popup modal state
@@ -39,7 +41,10 @@ function App() {
   };
 
   if (!currentUser) {
-    return <Login onLogin={setCurrentUser} />;
+    if (showLogin) {
+      return <Login onLogin={setCurrentUser} onBackToLanding={() => setShowLogin(false)} />;
+    }
+    return <LandingPage onEnterCRM={() => setShowLogin(true)} />;
   }
 
   return (

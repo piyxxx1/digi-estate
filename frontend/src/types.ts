@@ -35,6 +35,7 @@ export interface CallLog {
   duration: string;
   status: string;
   summary: string;
+  fromPhone?: string;
   toPhone?: string;
   direction?: string;
   flowName?: string;

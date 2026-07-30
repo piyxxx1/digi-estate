@@ -13,7 +13,7 @@ export function DialerModal({ activeCallLead, onClose }: DialerModalProps) {
   const [historyMessages, setHistoryMessages] = useState<Message[]>([]);
   const [showHistory, setShowHistory] = useState(false);
   const [recordingTime, setRecordingTime] = useState(0);
-  const [realtimeTranscript, setRealtimeTranscript] = useState('');
+  const realtimeTranscript = '';
   const [hasUpdated, setHasUpdated] = useState(false);
   const [activeCallSid, setActiveCallSid] = useState<string | null>(null);
 

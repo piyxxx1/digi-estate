@@ -143,7 +143,7 @@ export function ProfileTab({ currentUser }: ProfileTabProps) {
                 </button>
               </div>
             )}
-            <p style={{ margin: 0, color: 'rgba(255,255,255,0.7)', fontSize: '0.9rem' }}>Estate Manager · Digi-Estate CRM</p>
+            <p style={{ margin: 0, color: 'rgba(255,255,255,0.7)', fontSize: '0.9rem' }}>Operations Manager · DigiCRM</p>
           </div>
 
           <div style={{ textAlign: 'right' }}>
