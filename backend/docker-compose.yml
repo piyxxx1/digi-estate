@@ -35,6 +35,8 @@ services:
       - .:/app
     ports:
       - "8000:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672//
       - REDIS_URL=redis://redis:6379
@@ -54,6 +56,8 @@ services:
     command: celery -A backgroundworker.celery_app.celery_app worker --loglevel=info --concurrency=4
     volumes:
       - .:/app
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672//
       - REDIS_URL=redis://redis:6379

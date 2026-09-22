@@ -4,7 +4,7 @@ import asyncio
 import base64
 import websockets
 from typing import AsyncGenerator
-
+#sk_l9c71ean_JtEakgoFNxPa5al1ndB4RDV2
 
 class SarvamTTSService:
     def __init__(self):
@@ -33,7 +33,7 @@ class SarvamTTSService:
             config_msg = {
                 "type": "config",
                 "data": {
-                    "target_language_code": language_code,
+                    "language_code": language_code,
                     "speaker": os.getenv("SARVAM_SPEAKER"),
                     "pace": pace,
                     "speech_sample_rate": speech_sample_rate,

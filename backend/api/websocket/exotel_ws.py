@@ -9,7 +9,7 @@ from services.speech.audio_processor import AudioProcessor
 from services.ai.ai_service import GeminiService
 from services.ai.memory_manager import MemoryManager
 from utils.call_logger import initialize_call_log, finalize_call_log
-
+import wave
 import math
 import struct
 
@@ -112,8 +112,8 @@ async def _ensure_greeting_cached(sample_rate: int):
         while len(audio_bytes) > frame_size_20ms and audioop.rms(audio_bytes[:frame_size_20ms], 2) < 5:
             audio_bytes = audio_bytes[frame_size_20ms:]
 
-        # 200ms chunk sizes dynamically calculated per sample rate
-        chunk_size = int(sample_rate * 2 * 0.20)  # 200ms
+        # 100ms chunk sizes dynamically calculated per sample rate
+        chunk_size = int(sample_rate * 2 * 0.10)  # 100ms
         chunks = []
         for i in range(0, len(audio_bytes), chunk_size):
             chunk_data = audio_bytes[i:i + chunk_size]
@@ -166,7 +166,7 @@ async def _ensure_fast_path_cached(text: str, sample_rate: int):
         while len(audio_bytes) > frame_size_20ms and audioop.rms(audio_bytes[:frame_size_20ms], 2) < 5:
             audio_bytes = audio_bytes[frame_size_20ms:]
 
-        chunk_size = int(sample_rate * 2 * 0.20)  # 200ms chunks
+        chunk_size = int(sample_rate * 2 * 0.10)  # 100ms chunks
         chunks = []
         for i in range(0, len(audio_bytes), chunk_size):
             chunk_data = audio_bytes[i:i + chunk_size]
@@ -222,12 +222,12 @@ async def exotel_stream_handler(websocket: WebSocket):
     print("[Exotel WS] Voicebot Connection accepted")
     
     # ── Dynamic Sample Rate Extraction ──
-    # Exotel passes `sample-rate=24000` or `sample_rate=24000` as query params. Default is 8000
-    param_rate = websocket.query_params.get("sample-rate") or websocket.query_params.get("sample_rate") or "8000"
+    # Exotel passes `sample-rate=24000` or `sample_rate=24000` as query params. Default is 16000Hz if not specified.
+    param_rate = websocket.query_params.get("sample-rate") or websocket.query_params.get("sample_rate") or "16000"
     try:
         sample_rate = int(param_rate)
     except ValueError:
-        sample_rate = 8000
+        sample_rate = 16000
     print(f"[Exotel WS] Call streaming configured at {sample_rate}Hz")
 
     # Start caching greeting eagerly on connect to reduce start latency
@@ -235,7 +235,7 @@ async def exotel_stream_handler(websocket: WebSocket):
 
     # Frame and Chunk parameters calculated dynamically
     frame_size_20ms = int(sample_rate * 2 * 0.02)  # Multiple check pad (20ms)
-    chunk_size_200ms = int(sample_rate * 2 * 0.20)  # Playback chunk (200ms)
+    chunk_size_100ms = int(sample_rate * 2 * 0.10)  # Playback chunk (100ms)
 
     stt_service = SarvamSTTService()
     tts_service = SarvamTTSService()
@@ -245,6 +245,29 @@ async def exotel_stream_handler(websocket: WebSocket):
     
     stream_sid = None
     call_sid = None
+    stream_pcm_next_time = 0
+
+    async def send_paced(chunks_b64):
+        """Send a sequence of base64 PCM chunks to the websocket at real-time
+        cadence using absolute scheduling (prevents drift accumulation)."""
+        loop = asyncio.get_event_loop()
+        next_time = loop.time()
+        for chunk_b64 in chunks_b64:
+            if is_closed:
+                break
+            payload = json.dumps({
+                "event": "media",
+                "stream_sid": stream_sid,
+                "media": {"payload": chunk_b64}
+            }, separators=(',', ':'))
+            await websocket.send_text(payload)
+            chunk_bytes = base64.b64decode(chunk_b64)
+            duration = len(chunk_bytes) / (sample_rate * 2)
+            next_time += duration
+            sleep_for = next_time - loop.time()
+            if sleep_for > 0:
+                await asyncio.sleep(sleep_for)
+
     call_start_time = None
     audio_queue = asyncio.Queue()
     is_closed = False
@@ -257,7 +280,8 @@ async def exotel_stream_handler(websocket: WebSocket):
     latest_transcript = ""
     last_transcript_time = 0
     user_currently_speaking = False
-    
+    debug_exotel_audio = bytearray()
+    debug_exotel_logged_first_chunk = False
     async def audio_generator():
         while True:
             chunk = await audio_queue.get()
@@ -275,21 +299,8 @@ async def exotel_stream_handler(websocket: WebSocket):
         try:
             # Dynamically ensure cached for target sample_rate
             await _ensure_greeting_cached(sample_rate)
-            
-            for chunk_b64 in _greeting_chunks_cache.get(sample_rate, []):
-                if is_closed:
-                    break
-                payload = json.dumps({
-                    "event": "media",
-                    "stream_sid": stream_sid,
-                    "media": {"payload": chunk_b64}
-                }, separators=(',', ':'))
-                await websocket.send_text(payload)
-                # Dynamic pacing: sleep exactly as long as the chunk duration
-                chunk_bytes = len(base64.b64decode(chunk_b64))
-                duration = chunk_bytes / (sample_rate * 2)
-                await asyncio.sleep(duration)
-
+            chunks = _greeting_chunks_cache.get(sample_rate, [])
+            await send_paced(chunks)
             greeting_playing = False
             print(f"[Exotel WS] Greeting complete, now listening")
             memory_manager.save_interaction(call_sid or "default_user", "assistant", _GREETING_TEXT)
@@ -404,34 +415,88 @@ async def exotel_stream_handler(websocket: WebSocket):
         except Exception as e:
             print(f"[Exotel WS] Mark send error: {e}")
 
+    # Keep this buffer outside stream_pcm_to_exotel()
+    exotel_pcm_buffer = bytearray()
+
+
     async def stream_pcm_to_exotel(pcm_bytes: bytes):
-        """Send a chunk of raw PCM bytes to Exotel with dynamic real-time pacing."""
+        """Buffer Sarvam PCM and send fixed 40ms PCM frames to Exotel."""
+
         nonlocal stream_sid, is_closed, bot_speaking
+        nonlocal debug_exotel_audio, debug_exotel_logged_first_chunk
+        nonlocal stream_pcm_next_time
+
         if not stream_sid or is_closed or not pcm_bytes:
             return
 
-        chunk_size_40ms = int(sample_rate * 2 * 0.04)  # 40ms chunk size
-        for i in range(0, len(pcm_bytes), chunk_size_40ms):
+        # 16-bit mono PCM
+        # 16000 Hz * 2 bytes * 0.10 sec = 3200 bytes
+        chunk_size_100ms = int(sample_rate * 2 * 0.10)
+
+        # Add the new Sarvam audio to the persistent buffer
+        exotel_pcm_buffer.extend(pcm_bytes)
+
+        loop = asyncio.get_event_loop()
+        if stream_pcm_next_time < loop.time():
+            stream_pcm_next_time = loop.time()
+
+        # Send ONLY complete 100ms frames
+        while len(exotel_pcm_buffer) >= chunk_size_100ms:
+
             if is_closed:
                 return
-            chunk_data = pcm_bytes[i:i + chunk_size_40ms]
-            # Pad to multiple of dynamic frame size
-            if len(chunk_data) % frame_size_20ms != 0:
-                pad = frame_size_20ms - (len(chunk_data) % frame_size_20ms)
-                chunk_data = chunk_data + b'\x00' * pad
 
-            payload = json.dumps({
-                "event": "media",
-                "stream_sid": stream_sid,
-                "media": {
-                    "payload": base64.b64encode(chunk_data).decode('utf-8')
-                }
-            }, separators=(',', ':'))
+            chunk_data = bytes(
+                exotel_pcm_buffer[:chunk_size_100ms]
+            )
+
+            del exotel_pcm_buffer[:chunk_size_100ms]
+
+            # ==========================================
+            # DEBUG: EXACT PCM GOING TO EXOTEL
+            # ==========================================
+            debug_exotel_audio.extend(chunk_data)
+
+            payload = json.dumps(
+                {
+                    "event": "media",
+                    "stream_sid": stream_sid,
+                    "media": {
+                        "payload": base64.b64encode(chunk_data).decode("utf-8")
+                    },
+                },
+                separators=(",", ":"),
+            )
+
             await websocket.send_text(payload)
-            
-            # FIX 1: Dynamic real-time pacing — sleep exactly as long as the chunk duration
+
+            if not debug_exotel_logged_first_chunk:
+                debug_exotel_logged_first_chunk = True
+
+                print("=" * 60)
+                print("[EXOTEL OUT] FIRST AUDIO CHUNK")
+                print(f"[EXOTEL OUT] bytes: {len(chunk_data)}")
+                print(
+                    f"[EXOTEL OUT] duration: "
+                    f"{len(chunk_data) / (sample_rate * 2) * 1000:.1f} ms"
+                )
+                print(f"[EXOTEL OUT] sample_rate: {sample_rate}")
+                print("[EXOTEL OUT] channels: 1")
+                print("[EXOTEL OUT] sample_width: 2 bytes")
+                print("[EXOTEL OUT] format: PCM S16LE")
+                print(
+                    f"[EXOTEL OUT] first 20 bytes: "
+                    f"{chunk_data[:20].hex(' ')}"
+                )
+                print("=" * 60)
+
+            # Always exactly 100ms
             duration = len(chunk_data) / (sample_rate * 2)
-            await asyncio.sleep(duration)
+            stream_pcm_next_time += duration
+
+            sleep_for = stream_pcm_next_time - loop.time()
+            if sleep_for > 0:
+                await asyncio.sleep(sleep_for)
 
     # Booking Script State Machine (Call Session Level)
     booking_step = None  # None, "ask_name", "ask_phone", "ask_visit_date"
@@ -569,16 +634,7 @@ async def exotel_stream_handler(websocket: WebSocket):
             cached_chunks = _fast_path_cache.get(sample_rate, {}).get(fast_reply_text)
             if cached_chunks:
                 print(f"[Fast Path Cache] Dynamic cache HIT! Instant streaming start.")
-                for chunk_b64 in cached_chunks:
-                    if is_closed:
-                        break
-                    payload = json.dumps({
-                        "event": "media",
-                        "stream_sid": stream_sid,
-                        "media": {"payload": chunk_b64}
-                    }, separators=(',', ':'))
-                    await websocket.send_text(payload)
-                    await asyncio.sleep(0.164)  # 200ms paced chunk
+                await send_paced(cached_chunks)
             else:
                 # Persistent streaming fallback
                 print("[Fast Path Cache] Cache MISS. Streaming from persistent WS connection...")
@@ -588,7 +644,7 @@ async def exotel_stream_handler(websocket: WebSocket):
                 async for pcm_chunk in tts_service.stream_tts(
                     text_gen(),
                     language_code="hi-IN",
-                    pace=1.0,
+                    pace=0.9,
                     speech_sample_rate=sample_rate
                 ):
                     await stream_pcm_to_exotel(pcm_chunk)
@@ -614,27 +670,55 @@ async def exotel_stream_handler(websocket: WebSocket):
 
         try:
             async def gemini_text_generator():
-                nonlocal full_response, first_gemini_token_time
-                buffer = ""
-                async for chunk_text in ai_service.generate_response_stream(text, gemini_history):
-                    if first_gemini_token_time is None:
-                        first_gemini_token_time = asyncio.get_event_loop().time()
-                        ttft = first_gemini_token_time - pipeline_start_time
-                        print(f"[Latency Profile] TTFT (Time to First Gemini Token): {ttft * 1000:.1f}ms")
-                    
-                    full_response += chunk_text
-                    buffer += chunk_text
-                    
-                    punctuation_marks = [',', '.', '?', '!', '।', '\n']
-                    if any(p in buffer for p in punctuation_marks) or len(buffer.split()) >= 3:
-                        yield buffer
+                        nonlocal full_response, first_gemini_token_time
                         buffer = ""
-                
-                if buffer.strip():
-                    yield buffer
+
+                        # Only these force an immediate flush — real sentence/clause boundaries
+                        sentence_end_marks = ['.', '?', '!', '।', '\n']
+                        # Soft breakpoints — only used once the buffer is already long enough
+                        soft_break_marks = [',', ';', ':']
+
+                        MIN_WORDS_FOR_SOFT_BREAK = 8   # don't flush on a comma unless buffer has real content
+                        MAX_WORDS_HARD_CAP = 18        # safety valve for long unpunctuated runs (rare with LLMs, but just in case)
+
+                        async for chunk_text in ai_service.generate_response_stream(text, gemini_history):
+                            if first_gemini_token_time is None:
+                                first_gemini_token_time = asyncio.get_event_loop().time()
+                                ttft = first_gemini_token_time - pipeline_start_time
+                                print(f"[Latency Profile] TTFT (Time to First Gemini Token): {ttft * 1000:.1f}ms")
+
+                            full_response += chunk_text
+                            buffer += chunk_text
+                            word_count = len(buffer.split())
+
+                            should_flush = False
+
+                            # 1. Hard boundary: sentence/clause actually ended
+                            if any(buffer.rstrip().endswith(m) for m in sentence_end_marks):
+                                should_flush = True
+
+                            # 2. Soft boundary: comma etc., but only if buffer already has enough content
+                            elif word_count >= MIN_WORDS_FOR_SOFT_BREAK and any(m in buffer for m in soft_break_marks):
+                                should_flush = True
+
+                            # 3. Safety valve: buffer growing too long with no punctuation at all
+                            elif word_count >= MAX_WORDS_HARD_CAP:
+                                should_flush = True
+
+                            if should_flush:
+                                yield buffer
+                                buffer = ""
+
+                        if buffer.strip():
+                            yield buffer
 
             # Pipe Gemini stream into Sarvam TTS
-            bot_speaking = True  # FIX 3: Mark bot as speaking before audio begins
+            # Pipe Gemini stream into Sarvam TTS
+            bot_speaking = True
+
+            # DEBUG: collect raw Sarvam TTS audio
+            debug_tts_audio = bytearray()
+
             async for pcm_chunk in tts_service.stream_tts(
                 gemini_text_generator(),
                 language_code="hi-IN",
@@ -644,9 +728,70 @@ async def exotel_stream_handler(websocket: WebSocket):
                 if first_audio_chunk_time is None:
                     first_audio_chunk_time = asyncio.get_event_loop().time()
                     audio_latency = first_audio_chunk_time - pipeline_start_time
-                    print(f"[Latency Profile] Audio Latency (Time to first TTS audio packet): {audio_latency * 1000:.1f}ms")
-                    print(f"[Latency Profile] Total turn-around time (Silence → AI starts speaking): {audio_latency * 1000:.1f}ms")
+                    print(
+                        f"[Latency Profile] Audio Latency "
+                        f"(Time to first TTS audio packet): {audio_latency * 1000:.1f}ms"
+                    )
+
+                # SAVE RAW SARVAM PCM
+                debug_tts_audio.extend(pcm_chunk)
+
+                # Normal audio flow to Exotel
                 await stream_pcm_to_exotel(pcm_chunk)
+
+
+            # ==========================================
+            # DEBUG: SAVE RAW SARVAM AUDIO AS WAV
+            # ==========================================
+            if debug_tts_audio:
+                debug_path = f"/tmp/sarvam_{call_sid}.wav"
+
+                with wave.open(debug_path, "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)       # Linear16 = 16-bit
+                    wf.setframerate(sample_rate)
+                    wf.writeframes(bytes(debug_tts_audio))
+
+                print(
+                    f"[DEBUG] RAW SARVAM AUDIO SAVED: {debug_path} "
+                    f"({len(debug_tts_audio)} bytes, {sample_rate}Hz)"
+                )
+                # ==========================================
+            # DEBUG: SAVE EXACT PCM SENT TO EXOTEL
+            # ==========================================
+            if debug_exotel_audio and call_sid:
+                try:
+                    exotel_debug_path = f"/tmp/exotel_{call_sid}.wav"
+
+                    with wave.open(exotel_debug_path, "wb") as wf:
+                        wf.setnchannels(1)
+                        wf.setsampwidth(2)
+                        wf.setframerate(sample_rate)
+                        wf.writeframes(bytes(debug_exotel_audio))
+
+                    print(
+                        f"[DEBUG] EXACT EXOTEL AUDIO SAVED: "
+                        f"{exotel_debug_path} "
+                        f"({len(debug_exotel_audio)} bytes, {sample_rate}Hz)"
+                    )
+
+                except Exception as e:
+                    print(f"[DEBUG] Failed to save Exotel audio: {e}")
+
+            await send_mark("response_complete")
+            memory_manager.save_interaction(user_id, "assistant", full_response)
+            
+            total_duration = asyncio.get_event_loop().time() - pipeline_start_time
+            print(f"[Latency Profile] Complete turn execution time: {total_duration * 1000:.1f}ms")
+            print(f"[Exotel WS] Streaming response complete: {full_response[:80]}...")
+
+        except asyncio.CancelledError:
+            print("[Exotel WS] run_ai_tts_pipeline cancelled (barge-in)")
+            if full_response.strip():
+                memory_manager.save_interaction(user_id, "assistant", full_response + "...")
+            raise
+        except Exception as e:
+            print(f"[AI/TTS STREAM ERROR] {e}")
 
             await send_mark("response_complete")
             memory_manager.save_interaction(user_id, "assistant", full_response)
@@ -803,6 +948,13 @@ async def exotel_stream_handler(websocket: WebSocket):
                                     print(f"[Exotel WS] Dynamic sample rate updated from media_format: {sample_rate}Hz")
                                 except ValueError:
                                     pass
+                                # ========================================
+                        # DEBUG: Confirm actual Exotel audio format
+                        # ========================================
+                        print("========================================")
+                        print("[Exotel WS] MEDIA FORMAT:", media_format)
+                        print("[Exotel WS] ACTUAL SAMPLE RATE:", sample_rate)
+                        print("========================================")
 
                         # Establish persistent connection to Sarvam TTS immediately (Priority 1)
                         asyncio.create_task(tts_service.connect(sample_rate))
