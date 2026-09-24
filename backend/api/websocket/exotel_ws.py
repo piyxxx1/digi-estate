@@ -12,7 +12,7 @@ from utils.call_logger import initialize_call_log, finalize_call_log
 import wave
 import math
 import struct
-
+import time
 router = APIRouter()
 
 @router.post("/status-callback")
@@ -247,26 +247,27 @@ async def exotel_stream_handler(websocket: WebSocket):
     call_sid = None
     stream_pcm_next_time = 0
 
-    async def send_paced(chunks_b64):
+    async def send_paced(chunks_b64, generation: int):
         """Send a sequence of base64 PCM chunks to the websocket at real-time
         cadence using absolute scheduling (prevents drift accumulation)."""
         loop = asyncio.get_event_loop()
         next_time = loop.time()
         for chunk_b64 in chunks_b64:
-            if is_closed:
+            if is_closed or not playback_is_current(generation):
                 break
+            if not await wait_for_playback_slot(next_time, generation):
+                break
+            if not playback_is_current(generation):
+                break
+            chunk_bytes = base64.b64decode(chunk_b64)
+            duration = len(chunk_bytes) / (sample_rate * 2)
             payload = json.dumps({
                 "event": "media",
                 "stream_sid": stream_sid,
                 "media": {"payload": chunk_b64}
             }, separators=(',', ':'))
             await websocket.send_text(payload)
-            chunk_bytes = base64.b64decode(chunk_b64)
-            duration = len(chunk_bytes) / (sample_rate * 2)
             next_time += duration
-            sleep_for = next_time - loop.time()
-            if sleep_for > 0:
-                await asyncio.sleep(sleep_for)
 
     call_start_time = None
     audio_queue = asyncio.Queue()
@@ -280,8 +281,17 @@ async def exotel_stream_handler(websocket: WebSocket):
     latest_transcript = ""
     last_transcript_time = 0
     user_currently_speaking = False
+    bot_finished_at = None
+    silence_prompt_active = False
     debug_exotel_audio = bytearray()
     debug_exotel_logged_first_chunk = False
+
+    def reset_post_bot_silence():
+        """Cancel the post-playback silence window when the user is active."""
+        nonlocal bot_finished_at, silence_prompt_active
+        bot_finished_at = None
+        silence_prompt_active = False
+
     async def audio_generator():
         while True:
             chunk = await audio_queue.get()
@@ -295,27 +305,34 @@ async def exotel_stream_handler(websocket: WebSocket):
         if not stream_sid or is_closed:
             return
 
+        playback_id, exotel_playback_done = begin_playback()
         print(f"[Exotel WS] Sending greeting to {stream_sid} at {sample_rate}Hz")
         try:
             # Dynamically ensure cached for target sample_rate
             await _ensure_greeting_cached(sample_rate)
+            if not playback_is_current(playback_id):
+                return
             chunks = _greeting_chunks_cache.get(sample_rate, [])
-            await send_paced(chunks)
+            await send_paced(chunks, playback_id)
+            if playback_is_current(playback_id):
+                exotel_playback_done.set()
             greeting_playing = False
             print(f"[Exotel WS] Greeting complete, now listening")
             memory_manager.save_interaction(call_sid or "default_user", "assistant", _GREETING_TEXT)
         except asyncio.CancelledError:
+            exotel_playback_done.set()
             greeting_playing = False
             print("[Exotel WS] Greeting cancelled by barge-in")
             memory_manager.save_interaction(call_sid or "default_user", "assistant", "नमस्ते, मैं Priya बोल रही हूँ, Charaktaal Eco Village से...")
             raise
         except Exception as e:
+            exotel_playback_done.set()
             greeting_playing = False
             print(f"[Exotel WS] Greeting send error: {e}")
 
     async def send_clear():
         """Send clear event to Exotel to flush its audio buffer on barge-in."""
-        nonlocal stream_sid, is_closed
+        nonlocal stream_sid, is_closed, exotel_next_send_time
         if not stream_sid or is_closed:
             return
         try:
@@ -324,9 +341,28 @@ async def exotel_stream_handler(websocket: WebSocket):
                 "stream_sid": stream_sid
             }, separators=(',', ':'))
             await websocket.send_text(payload)
-            print("[Exotel WS] Clear sent to flush Exotel audio buffer")
+            print("[BARGE-IN] Exotel clear sent")
         except Exception as e:
             print(f"[Exotel WS] Clear send error: {e}")
+
+    async def stop_bot_playback_for_barge_in():
+        """Invalidate stale audio before asking Exotel to clear its buffer."""
+        nonlocal greeting_playing, bot_speaking
+
+        # Cancel producers first, then invalidate their generation before any
+        # local/external buffer operation. The permanent sender task remains
+        # alive and rejects every old-generation item.
+        bot_speaking = False
+        if greeting_playing and greeting_task and not greeting_task.done():
+            print("[BARGE-IN] cancelling greeting task")
+            greeting_task.cancel()
+            greeting_playing = False
+        if response_task and not response_task.done():
+            print("[BARGE-IN] cancelling response task")
+            response_task.cancel()
+
+        invalidate_playback()
+        await send_clear()
 
     async def handle_sarvam_responses():
         nonlocal stream_sid, latest_transcript, last_transcript_time, response_task, greeting_task, greeting_playing, bot_speaking, user_currently_speaking
@@ -334,10 +370,19 @@ async def exotel_stream_handler(websocket: WebSocket):
             async for result in stt_service.stream_transcription(audio_generator()):
                 msg_type = result.get("type", "")
 
-                # VAD: User STARTED speaking → Log only, do not aggressively cancel yet
+                # VAD: User STARTED speaking → stop bot playback immediately.
+                # Do not wait for transcript recognition; it arrives too late for
+                # natural barge-in behavior.
                 if msg_type == "speech_start":
-                    print("[Exotel WS] VAD Speech Start detected")
+                    print("[BARGE-IN] speech_start detected")
                     user_currently_speaking = True
+                    reset_post_bot_silence()
+                    # Exotel can acknowledge a mark before the caller has
+                    # audibly drained all remote media. Keep clear available
+                    # for that post-mark playback window as well.
+                    if bot_speaking or greeting_playing or playback_may_be_active:
+                        print("[BARGE-IN] stopping playback")
+                        await stop_bot_playback_for_barge_in()
                     continue
 
                 # VAD: User STOPPED speaking → accelerate silence timer
@@ -345,6 +390,7 @@ async def exotel_stream_handler(websocket: WebSocket):
                     print("[Exotel WS] VAD Speech End detected")
                     user_currently_speaking = False
                     last_transcript_time = asyncio.get_event_loop().time() - 0.2
+                    reset_post_bot_silence()
                     continue
 
                 # Transcript result
@@ -355,13 +401,20 @@ async def exotel_stream_handler(websocket: WebSocket):
                     transcript = result.get("transcript", "")
 
                 if transcript:
+                    # Any recognized user audio ends the current post-bot idle
+                    # period, even if the text is later filtered as a weak
+                    # barge-in/echo candidate.
+                    reset_post_bot_silence()
                     cleaned_t = transcript.strip().lower().replace(".", "").replace("?", "").replace("।", "")
                     ignore_list = ["हम्म", "क्या", "hmm", "han", "kya", "hello", "hi", "hey", "हाँ", "हा", "जी", "अच्छा", "हेलो"]
 
-                    # FIX 3: If bot is currently speaking, ignore weak/short STT (echo from bot's own voice)
+                    # VAD is the primary gate while the bot is speaking
                     if bot_speaking:
-                        if len(cleaned_t) < 12:
-                            print(f"[Exotel WS] Ignoring STT while bot speaking (echo suppression): '{transcript}'")
+                        if not user_currently_speaking:
+                            print(f"[Exotel WS] Ignoring STT while bot speaking (echo/noise - no VAD): '{transcript}'")
+                            continue
+                        if len(cleaned_t) < 12 or len(cleaned_t) < 4 or cleaned_t in ignore_list:
+                            print(f"[Exotel WS] Ignoring short/filler STT while bot speaking (VAD active): '{transcript}'")
                             continue
                         print(f"[Exotel WS] Strong barge-in detected while bot speaking: '{transcript}'")
 
@@ -373,17 +426,13 @@ async def exotel_stream_handler(websocket: WebSocket):
                         else:
                             latest_transcript = transcript
                         last_transcript_time = asyncio.get_event_loop().time()
+                        reset_post_bot_silence()
 
                         # FIX 2: Perform barge-in cancellation + clear Exotel buffer
-                        if greeting_playing and greeting_task and not greeting_task.done():
-                            print("[Exotel WS] Transcript Barge-in: Cancelling greeting")
-                            greeting_task.cancel()
-                            greeting_playing = False
-                            asyncio.create_task(send_clear())
-                        if response_task and not response_task.done():
-                            print("[Exotel WS] Transcript Barge-in: Cancelling AI response/TTS")
-                            response_task.cancel()
-                            asyncio.create_task(send_clear())
+                        if ((greeting_playing and greeting_task and not greeting_task.done()) or
+                                (response_task and not response_task.done())):
+                            print("[Exotel WS] Transcript Barge-in: cancelling active playback")
+                            await stop_bot_playback_for_barge_in()
                     else:
                         print(f"[Exotel WS] Ignoring tiny/filler STT interruption: '{transcript}'")
                         # Accept it for standard processing only if AI is silent
@@ -393,6 +442,7 @@ async def exotel_stream_handler(websocket: WebSocket):
                             else:
                                 latest_transcript = transcript
                             last_transcript_time = asyncio.get_event_loop().time()
+                            reset_post_bot_silence()
 
                 elif "error" in result:
                     print(f"[Exotel WS] Sarvam Error: {result.get('error')}")
@@ -416,96 +466,215 @@ async def exotel_stream_handler(websocket: WebSocket):
             print(f"[Exotel WS] Mark send error: {e}")
 
     # Keep this buffer outside stream_pcm_to_exotel()
+    exotel_pcm_queue = asyncio.Queue()
     exotel_pcm_buffer = bytearray()
+    exotel_next_send_time = 0.0
+    playback_generation = 0
+    playback_may_be_active = False
+    exotel_buffer_generation = 0
+    playback_interrupt_event = asyncio.Event()
+    # A response owns one initially-clear completion Event, keyed by its
+    # generation so a cancelled playback cannot release a later response.
+    exotel_playback_done_events = {}
 
+    def playback_is_current(generation: int) -> bool:
+        return generation == playback_generation and not playback_interrupt_event.is_set()
 
-    async def stream_pcm_to_exotel(pcm_bytes: bytes):
-        """Buffer Sarvam PCM and send fixed 40ms PCM frames to Exotel."""
+    def begin_playback() -> tuple[int, asyncio.Event]:
+        nonlocal playback_generation, playback_may_be_active
+        previous_exotel_playback_done = exotel_playback_done_events.pop(playback_generation, None)
+        if previous_exotel_playback_done:
+            # Starting a replacement generation must not strand a previous
+            # pipeline that was waiting for its own completion event.
+            previous_exotel_playback_done.set()
+        playback_generation += 1
+        playback_may_be_active = True
+        playback_interrupt_event.clear()
+        exotel_playback_done = asyncio.Event()
+        exotel_playback_done_events[playback_generation] = exotel_playback_done
+        return playback_generation, exotel_playback_done
 
-        nonlocal stream_sid, is_closed, bot_speaking
-        nonlocal debug_exotel_audio, debug_exotel_logged_first_chunk
-        nonlocal stream_pcm_next_time
+    def finish_exotel_playback(generation: int):
+        """Release the waiter for a sender-drained playback generation."""
+        exotel_playback_done = exotel_playback_done_events.get(generation)
+        if exotel_playback_done:
+            exotel_playback_done.set()
 
-        if not stream_sid or is_closed or not pcm_bytes:
+    def invalidate_playback():
+        nonlocal playback_generation, playback_may_be_active, exotel_next_send_time, exotel_buffer_generation
+        previous_generation = playback_generation
+        previous_exotel_playback_done = exotel_playback_done_events.pop(previous_generation, None)
+        if previous_exotel_playback_done:
+            # A barge-in must also unblock a pipeline already waiting for its
+            # final PCM frame to leave the sender.
+            previous_exotel_playback_done.set()
+        playback_generation += 1
+        playback_may_be_active = False
+        playback_interrupt_event.set()
+        exotel_pcm_buffer.clear()
+        while not exotel_pcm_queue.empty():
+            try:
+                exotel_pcm_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        exotel_buffer_generation = playback_generation
+        exotel_next_send_time = 0.0
+        print("[BARGE-IN] local audio buffers cleared; old playback generation invalidated")
+
+    async def wait_for_playback_slot(target_time: float, generation: int) -> bool:
+        delay = target_time - asyncio.get_event_loop().time()
+        if delay > 0:
+            try:
+                await asyncio.wait_for(playback_interrupt_event.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                pass
+        return playback_is_current(generation)
+
+    async def stream_pcm_to_exotel(pcm_bytes: bytes, generation: int):
+        """Enqueue Sarvam PCM bytes to be sent in fixed 100ms frames."""
+        nonlocal stream_sid, is_closed
+        if not stream_sid or is_closed or not playback_is_current(generation):
             return
+        await exotel_pcm_queue.put((generation, pcm_bytes))
 
-        # 16-bit mono PCM
+    async def wait_for_exotel_playback_done(generation: int, exotel_playback_done: asyncio.Event) -> bool:
+        """Wait for this playback's final queued PCM frame, unless interrupted."""
+        await exotel_playback_done.wait()
+        return playback_is_current(generation)
+
+    async def exotel_sender_task_loop():
+        """Dedicated task to buffer and send 100ms PCM frames continuously."""
+        nonlocal stream_sid, is_closed, debug_exotel_logged_first_chunk
+        nonlocal exotel_next_send_time, exotel_pcm_buffer, exotel_buffer_generation
+        
         # 16000 Hz * 2 bytes * 0.10 sec = 3200 bytes
         chunk_size_100ms = int(sample_rate * 2 * 0.10)
-
-        # Add the new Sarvam audio to the persistent buffer
-        exotel_pcm_buffer.extend(pcm_bytes)
-
         loop = asyncio.get_event_loop()
-        if stream_pcm_next_time < loop.time():
-            stream_pcm_next_time = loop.time()
-
-        # Send ONLY complete 100ms frames
-        while len(exotel_pcm_buffer) >= chunk_size_100ms:
-
-            if is_closed:
-                return
-
-            chunk_data = bytes(
-                exotel_pcm_buffer[:chunk_size_100ms]
-            )
-
-            del exotel_pcm_buffer[:chunk_size_100ms]
-
-            # ==========================================
-            # DEBUG: EXACT PCM GOING TO EXOTEL
-            # ==========================================
-            debug_exotel_audio.extend(chunk_data)
-
-            payload = json.dumps(
-                {
-                    "event": "media",
-                    "stream_sid": stream_sid,
-                    "media": {
-                        "payload": base64.b64encode(chunk_data).decode("utf-8")
-                    },
-                },
-                separators=(",", ":"),
-            )
-
-            await websocket.send_text(payload)
-
-            if not debug_exotel_logged_first_chunk:
-                debug_exotel_logged_first_chunk = True
-
-                print("=" * 60)
-                print("[EXOTEL OUT] FIRST AUDIO CHUNK")
-                print(f"[EXOTEL OUT] bytes: {len(chunk_data)}")
-                print(
-                    f"[EXOTEL OUT] duration: "
-                    f"{len(chunk_data) / (sample_rate * 2) * 1000:.1f} ms"
-                )
-                print(f"[EXOTEL OUT] sample_rate: {sample_rate}")
-                print("[EXOTEL OUT] channels: 1")
-                print("[EXOTEL OUT] sample_width: 2 bytes")
-                print("[EXOTEL OUT] format: PCM S16LE")
-                print(
-                    f"[EXOTEL OUT] first 20 bytes: "
-                    f"{chunk_data[:20].hex(' ')}"
-                )
-                print("=" * 60)
-
-            # Always exactly 100ms
-            duration = len(chunk_data) / (sample_rate * 2)
-            stream_pcm_next_time += duration
-
-            sleep_for = stream_pcm_next_time - loop.time()
-            if sleep_for > 0:
-                await asyncio.sleep(sleep_for)
+        
+        while not is_closed:
+            try:
+                # Wait for data or flush signal with a short timeout to allow checking is_closed
+                generation, chunk = await asyncio.wait_for(exotel_pcm_queue.get(), timeout=0.01)
+                if not playback_is_current(generation):
+                    continue
+                
+                if chunk == b"":
+                    # Flush signal: if we have residual data, pad and send it
+                    if len(exotel_pcm_buffer) > 0:
+                        pad_len = chunk_size_100ms - len(exotel_pcm_buffer)
+                        exotel_pcm_buffer.extend(b"\x00" * pad_len)
+                        
+                        if not await wait_for_playback_slot(exotel_next_send_time, generation):
+                            exotel_pcm_buffer.clear()
+                            continue
+                        now = loop.time()
+                        
+                        chunk_data = bytes(exotel_pcm_buffer[:chunk_size_100ms])
+                        exotel_pcm_buffer.clear()
+                        
+                        try:
+                            if not is_closed and playback_is_current(generation):
+                                payload = json.dumps({
+                                    "event": "media",
+                                    "stream_sid": stream_sid,
+                                    "media": {"payload": base64.b64encode(chunk_data).decode("utf-8")}
+                                }, separators=(",", ":"))
+                                await websocket.send_text(payload)
+                        except Exception as e:
+                            print(f"[Exotel Sender] Final flush error: {e}")
+                            invalidate_playback()
+                            continue
+                            
+                        exotel_next_send_time = now + 0.10
+                    # The end marker reaches this point only after every
+                    # complete frame plus any padded residual frame was sent.
+                    if playback_is_current(generation):
+                        finish_exotel_playback(generation)
+                elif chunk:
+                    now = loop.time()
+                    if len(exotel_pcm_buffer) and exotel_buffer_generation != generation:
+                        exotel_pcm_buffer.clear()
+                    # If this is a fresh start (buffer was empty and scheduling is behind)
+                    if len(exotel_pcm_buffer) == 0 and exotel_next_send_time < now:
+                        # 200ms prebuffer
+                        exotel_next_send_time = now + 0.200
+                    exotel_buffer_generation = generation
+                    exotel_pcm_buffer.extend(chunk)
+                    
+            except asyncio.TimeoutError:
+                pass
+            except Exception as e:
+                print(f"[Exotel Sender] Queue get error: {e}")
+                
+            # Send all complete 100ms frames
+            while len(exotel_pcm_buffer) >= chunk_size_100ms:
+                generation = exotel_buffer_generation
+                if not playback_is_current(generation):
+                    exotel_pcm_buffer.clear()
+                    break
+                now = loop.time()
+                # If we're ahead of the pacing schedule, wait for the exact moment
+                if not await wait_for_playback_slot(exotel_next_send_time, generation):
+                    exotel_pcm_buffer.clear()
+                    break
+                now = loop.time()
+                
+                chunk_data = bytes(exotel_pcm_buffer[:chunk_size_100ms])
+                del exotel_pcm_buffer[:chunk_size_100ms]
+                
+                try:
+                    if not is_closed and playback_is_current(generation):
+                        payload = json.dumps({
+                            "event": "media",
+                            "stream_sid": stream_sid,
+                            "media": {"payload": base64.b64encode(chunk_data).decode("utf-8")}
+                        }, separators=(",", ":"))
+                        await websocket.send_text(payload)
+                except Exception as e:
+                    print(f"[Exotel Sender] Send error: {e}")
+                    invalidate_playback()
+                    break
+                    
+                if not debug_exotel_logged_first_chunk:
+                    debug_exotel_logged_first_chunk = True
+                    print("=" * 60)
+                    print("[EXOTEL OUT] FIRST AUDIO CHUNK (100ms pacing)")
+                    print(f"[EXOTEL OUT] bytes: {len(chunk_data)}")
+                    print(f"[EXOTEL OUT] duration: {len(chunk_data) / (sample_rate * 2) * 1000:.1f} ms")
+                    print(f"[EXOTEL OUT] sample_rate: {sample_rate}")
+                    print("[EXOTEL OUT] channels: 1")
+                    print("[EXOTEL OUT] sample_width: 2 bytes")
+                    print("[EXOTEL OUT] format: PCM S16LE")
+                    print("=" * 60)
+                
+                # Advance next_send_time exactly by 100ms
+                exotel_next_send_time += 0.10
 
     # Booking Script State Machine (Call Session Level)
     booking_step = None  # None, "ask_name", "ask_phone", "ask_visit_date"
     booking_details = {}
 
-    async def run_ai_tts_pipeline(text: str):
+    async def run_ai_tts_pipeline(text: str, is_system_prompt: bool = False):
         """Full streaming pipeline: text → Gemini stream → Sarvam TTS WS stream → Exotel PCM"""
-        nonlocal stream_sid, is_closed, booking_step, booking_details, call_sid
+        nonlocal stream_sid, is_closed, booking_step, booking_details, call_sid, bot_speaking, bot_finished_at, silence_prompt_active
         user_id = call_sid or "default_user"
+        bot_speaking = True
+        bot_finished_at = None
+        silence_prompt_active = False
+        playback_id, exotel_playback_done = begin_playback()
+        playback_end_enqueued = False
+
+        async def send_response_complete_after_playback() -> bool:
+            """Put the mark behind this response's final sender-drained frame."""
+            nonlocal playback_end_enqueued
+            if not playback_end_enqueued:
+                await stream_pcm_to_exotel(b"", playback_id)
+                playback_end_enqueued = True
+            if not await wait_for_exotel_playback_done(playback_id, exotel_playback_done):
+                return False
+            await send_mark("response_complete")
+            exotel_playback_done_events.pop(playback_id, None)
+            return True
         
         # Clean text for simple intent matching
         cleaned = text.strip().lower()
@@ -628,36 +797,49 @@ async def exotel_stream_handler(websocket: WebSocket):
         # ── Fast Path Audio Playback (Bypasses Gemini & TTS Generation entirely!) ──
         if use_scripted_fast_path:
             print(f"[FAST PATH MATCH] State: '{booking_step}'. Reply: '{fast_reply_text}'")
-            memory_manager.save_interaction(user_id, "user", text)
-            
-            # Check dynamic cache
-            cached_chunks = _fast_path_cache.get(sample_rate, {}).get(fast_reply_text)
-            if cached_chunks:
-                print(f"[Fast Path Cache] Dynamic cache HIT! Instant streaming start.")
-                await send_paced(cached_chunks)
-            else:
-                # Persistent streaming fallback
-                print("[Fast Path Cache] Cache MISS. Streaming from persistent WS connection...")
-                async def text_gen():
-                    yield fast_reply_text
-                
-                async for pcm_chunk in tts_service.stream_tts(
-                    text_gen(),
-                    language_code="hi-IN",
-                    pace=0.9,
-                    speech_sample_rate=sample_rate
-                ):
-                    await stream_pcm_to_exotel(pcm_chunk)
-            
-            await send_mark("response_complete")
-            memory_manager.save_interaction(user_id, "assistant", fast_reply_text)
-            
-            total_duration = asyncio.get_event_loop().time() - pipeline_start_time
-            print(f"[Latency Profile] [Fast Path] Turn Complete: {total_duration * 1000:.1f}ms")
+            if not is_system_prompt:
+                memory_manager.save_interaction(user_id, "user", text)
+
+            try:
+                # Check dynamic cache
+                cached_chunks = _fast_path_cache.get(sample_rate, {}).get(fast_reply_text)
+                if cached_chunks:
+                    print(f"[Fast Path Cache] Dynamic cache HIT! Instant streaming start.")
+                    await send_paced(cached_chunks, playback_id)
+                else:
+                    # Each response owns one Sarvam streaming connection.
+                    print("[Fast Path Cache] Cache MISS. Streaming through turn-scoped WS connection...")
+                    async def text_gen():
+                        yield fast_reply_text
+
+                    async for pcm_chunk in tts_service.stream_tts(
+                        text_gen(),
+                        language_code="hi-IN",
+                        pace=1.0,
+                        speech_sample_rate=sample_rate
+                    ):
+                        await stream_pcm_to_exotel(pcm_chunk, playback_id)
+                await stream_pcm_to_exotel(b"", playback_id)
+                playback_end_enqueued = True
+
+                if not await send_response_complete_after_playback():
+                    return
+                memory_manager.save_interaction(user_id, "assistant", fast_reply_text)
+
+                total_duration = asyncio.get_event_loop().time() - pipeline_start_time
+                print(f"[Latency Profile] [Fast Path] Turn Complete: {total_duration * 1000:.1f}ms")
+            except asyncio.CancelledError:
+                print("[Exotel WS] Fast-path pipeline cancelled (barge-in)")
+                if playback_is_current(playback_id):
+                    invalidate_playback()
+                exotel_playback_done_events.pop(playback_id, None)
+                bot_speaking = False
+                raise
             return
 
         # ── Standard Route: Gemini AI & Sarvam TTS Streaming ──
-        memory_manager.save_interaction(user_id, "user", text)
+        if not is_system_prompt:
+            memory_manager.save_interaction(user_id, "user", text)
         history = memory_manager.get_history(user_id)
         print(f"DEBUG: history length: {len(history)} for user {user_id}")
         for m in history:
@@ -670,51 +852,20 @@ async def exotel_stream_handler(websocket: WebSocket):
 
         try:
             async def gemini_text_generator():
-                        nonlocal full_response, first_gemini_token_time
-                        buffer = ""
+                nonlocal full_response, first_gemini_token_time
+                async for chunk_text in ai_service.generate_response_stream(text, gemini_history):
+                    if first_gemini_token_time is None:
+                        first_gemini_token_time = asyncio.get_event_loop().time()
+                        ttft = first_gemini_token_time - pipeline_start_time
+                        print(f"[Latency Profile] TTFT (Time to First Gemini Token): {ttft * 1000:.1f}ms")
 
-                        # Only these force an immediate flush — real sentence/clause boundaries
-                        sentence_end_marks = ['.', '?', '!', '।', '\n']
-                        # Soft breakpoints — only used once the buffer is already long enough
-                        soft_break_marks = [',', ';', ':']
-
-                        MIN_WORDS_FOR_SOFT_BREAK = 8   # don't flush on a comma unless buffer has real content
-                        MAX_WORDS_HARD_CAP = 18        # safety valve for long unpunctuated runs (rare with LLMs, but just in case)
-
-                        async for chunk_text in ai_service.generate_response_stream(text, gemini_history):
-                            if first_gemini_token_time is None:
-                                first_gemini_token_time = asyncio.get_event_loop().time()
-                                ttft = first_gemini_token_time - pipeline_start_time
-                                print(f"[Latency Profile] TTFT (Time to First Gemini Token): {ttft * 1000:.1f}ms")
-
-                            full_response += chunk_text
-                            buffer += chunk_text
-                            word_count = len(buffer.split())
-
-                            should_flush = False
-
-                            # 1. Hard boundary: sentence/clause actually ended
-                            if any(buffer.rstrip().endswith(m) for m in sentence_end_marks):
-                                should_flush = True
-
-                            # 2. Soft boundary: comma etc., but only if buffer already has enough content
-                            elif word_count >= MIN_WORDS_FOR_SOFT_BREAK and any(m in buffer for m in soft_break_marks):
-                                should_flush = True
-
-                            # 3. Safety valve: buffer growing too long with no punctuation at all
-                            elif word_count >= MAX_WORDS_HARD_CAP:
-                                should_flush = True
-
-                            if should_flush:
-                                yield buffer
-                                buffer = ""
-
-                        if buffer.strip():
-                            yield buffer
+                    full_response += chunk_text
+                    # Forward each Gemini fragment immediately. Sarvam's
+                    # min_buffer_size/max_chunk_length own speech buffering.
+                    yield chunk_text
 
             # Pipe Gemini stream into Sarvam TTS
             # Pipe Gemini stream into Sarvam TTS
-            bot_speaking = True
 
             # DEBUG: collect raw Sarvam TTS audio
             debug_tts_audio = bytearray()
@@ -737,7 +888,9 @@ async def exotel_stream_handler(websocket: WebSocket):
                 debug_tts_audio.extend(pcm_chunk)
 
                 # Normal audio flow to Exotel
-                await stream_pcm_to_exotel(pcm_chunk)
+                await stream_pcm_to_exotel(pcm_chunk, playback_id)
+            await stream_pcm_to_exotel(b"", playback_id)
+            playback_end_enqueued = True
 
 
             # ==========================================
@@ -778,7 +931,8 @@ async def exotel_stream_handler(websocket: WebSocket):
                 except Exception as e:
                     print(f"[DEBUG] Failed to save Exotel audio: {e}")
 
-            await send_mark("response_complete")
+            if not await send_response_complete_after_playback():
+                return
             memory_manager.save_interaction(user_id, "assistant", full_response)
             
             total_duration = asyncio.get_event_loop().time() - pipeline_start_time
@@ -787,51 +941,44 @@ async def exotel_stream_handler(websocket: WebSocket):
 
         except asyncio.CancelledError:
             print("[Exotel WS] run_ai_tts_pipeline cancelled (barge-in)")
+            if playback_is_current(playback_id):
+                invalidate_playback()
+            exotel_playback_done_events.pop(playback_id, None)
+            bot_speaking = False
             if full_response.strip():
                 memory_manager.save_interaction(user_id, "assistant", full_response + "...")
             raise
         except Exception as e:
             print(f"[AI/TTS STREAM ERROR] {e}")
 
-            await send_mark("response_complete")
+            if not await send_response_complete_after_playback():
+                return
             memory_manager.save_interaction(user_id, "assistant", full_response)
             
             total_duration = asyncio.get_event_loop().time() - pipeline_start_time
             print(f"[Latency Profile] Complete turn execution time: {total_duration * 1000:.1f}ms")
             print(f"[Exotel WS] Streaming response complete: {full_response[:80]}...")
-
-        except asyncio.CancelledError:
-            print("[Exotel WS] run_ai_tts_pipeline cancelled (barge-in)")
-            if full_response.strip():
-                memory_manager.save_interaction(user_id, "assistant", full_response + "...")
-            raise
-        except Exception as e:
-            print(f"[AI/TTS STREAM ERROR] {e}")
 
     async def process_after_silence():
-        nonlocal latest_transcript, last_transcript_time, stream_sid, is_closed, response_task, user_currently_speaking
-        
-        last_interaction_time = asyncio.get_event_loop().time()
+        nonlocal latest_transcript, last_transcript_time, stream_sid, is_closed, response_task, user_currently_speaking, bot_finished_at, silence_prompt_active
         
         while not is_closed:
             await asyncio.sleep(0.3)
             current_time = asyncio.get_event_loop().time()
             
-            # Keep the interaction timer updated if anyone is speaking or system is processing
-            if (bot_speaking or 
-                greeting_playing or 
-                user_currently_speaking or 
-                bool(latest_transcript) or 
-                (response_task and not response_task.done()) or
-                (greeting_task and not greeting_task.done())):
-                last_interaction_time = current_time
+            # Never evaluate silence while either party is speaking or an
+            # assistant response/greeting remains active.
+            if (bot_speaking or greeting_playing or user_currently_speaking or
+                    (response_task and not response_task.done()) or
+                    (greeting_task and not greeting_task.done())):
+                continue
 
             if latest_transcript:
                 silence_duration = current_time - last_transcript_time
                 # Trigger response if:
                 # 1. User stopped speaking and silence duration > 450ms
                 # 2. Or fallback limit of 1.5s hit (in case of missing VAD speech_end packet)
-                if (not user_currently_speaking and silence_duration > 0.45) or (silence_duration > 1.5):
+                if (not user_currently_speaking and silence_duration > 0.75) or (silence_duration > 1.8):
                     final_text = latest_transcript.strip()
                     latest_transcript = "" 
                     user_currently_speaking = False
@@ -846,24 +993,20 @@ async def exotel_stream_handler(websocket: WebSocket):
                             pass
                         
                     response_task = asyncio.create_task(run_ai_tts_pipeline(final_text))
-            else:
-                # Detect long silence when the line is completely idle
-                if current_time - last_interaction_time > 10.0:
-                    print("[Exotel WS] 11s silence detected. Prompting user.")
-                    last_interaction_time = current_time + 5.0  # Prevent immediate re-trigger
-                    
-                    if response_task and not response_task.done():
-                        response_task.cancel()
-                        try:
-                            await response_task
-                        except asyncio.CancelledError:
-                            pass
-                            
-                    silence_prompt = "[SYSTEM] The user has been completely silent for 11 seconds. Ask them if they are still there on the line in a short, natural way (e.g. 'Hello? Are you there?'), matching the language of the conversation."
-                    response_task = asyncio.create_task(run_ai_tts_pipeline(silence_prompt))
+                continue
+
+            # Start the idle countdown only after Exotel acknowledges that the
+            # current bot playback has completed. A prompt fires once per turn.
+            if (bot_finished_at is not None and not silence_prompt_active and
+                    current_time - bot_finished_at >= 10.0):
+                print("[Exotel WS] 10s post-playback silence detected. Prompting user.")
+                silence_prompt_active = True
+                silence_prompt = "[SYSTEM] The user has been completely silent for 11 seconds. Ask them if they are still there on the line in a short, natural way (e.g. 'Hello? Are you there?'), matching the language of the conversation."
+                response_task = asyncio.create_task(run_ai_tts_pipeline(silence_prompt, is_system_prompt=True))
 
     sarvam_task = asyncio.create_task(handle_sarvam_responses())
     silence_task = asyncio.create_task(process_after_silence())
+    exotel_sender_task = asyncio.create_task(exotel_sender_task_loop())
 
     first_media_logged = False
     try:
@@ -956,9 +1099,6 @@ async def exotel_stream_handler(websocket: WebSocket):
                         print("[Exotel WS] ACTUAL SAMPLE RATE:", sample_rate)
                         print("========================================")
 
-                        # Establish persistent connection to Sarvam TTS immediately (Priority 1)
-                        asyncio.create_task(tts_service.connect(sample_rate))
-                        
                         # Pre-cache all scripted replies in background at this sample rate (Priority 4)
                         for reply in SCRIPTED_REPLIES:
                             asyncio.create_task(_ensure_fast_path_cached(reply, sample_rate))
@@ -988,15 +1128,22 @@ async def exotel_stream_handler(websocket: WebSocket):
                         mark_name = message.get("mark", {}).get("name", "")
                         print(f"[Exotel WS] Mark acknowledged: {mark_name}")
                         if mark_name == "response_complete":
-                            bot_speaking = False  # FIX 3: Bot finished speaking
+                            bot_speaking = False
+                            bot_finished_at = asyncio.get_event_loop().time()
+                            silence_prompt_active = False
+                            if not user_currently_speaking:
+                                latest_transcript = ""
+                                print("[Exotel WS] Cleared stale transcript after bot finished speaking")
 
                     elif event == "clear":
                         print("[Exotel WS] Clear event: User interrupted (barge-in from Exotel)")
+                        invalidate_playback()
                         if greeting_playing and greeting_task and not greeting_task.done():
                             greeting_task.cancel()
                             greeting_playing = False
                         if response_task and not response_task.done():
                             response_task.cancel()
+                            bot_speaking = False
                             print("[Exotel WS] Barge-in: AI response cancelled via clear event")
                 
                 elif "bytes" in result:
@@ -1011,15 +1158,17 @@ async def exotel_stream_handler(websocket: WebSocket):
         print(f"[Exotel WS] Error in loop: {e}")
     finally:
         is_closed = True
+        invalidate_playback()
         await audio_queue.put(None)
-        
-        # Cleanly disconnect persistent TTS connection (Priority 1)
-        await tts_service.disconnect()
         
         if greeting_task and not greeting_task.done():
             greeting_task.cancel()
+        if response_task and not response_task.done():
+            response_task.cancel()
         if not sarvam_task.done():
             sarvam_task.cancel()
+        if 'exotel_sender_task' in locals() and not exotel_sender_task.done():
+            exotel_sender_task.cancel()
         if 'silence_task' in locals() and not silence_task.done():
             silence_task.cancel()
             

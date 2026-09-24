@@ -90,14 +90,19 @@ class SarvamSTTService:
                     try:
                         data = json.loads(raw_msg)
                         msg_type = data.get("type", "")
+                        signal_type = (
+                            data.get("data", {}).get("signal_type")
+                            or data.get("signal_type", "")
+                        )
 
-                        if msg_type == "speech_start":
-                            # VAD: user started speaking
+                        # Sarvam legacy streaming VAD can arrive either as a
+                        # direct speech_start/speech_end message or as an
+                        # events envelope containing START_SPEECH/END_SPEECH.
+                        if msg_type == "speech_start" or signal_type == "START_SPEECH":
                             print("[Sarvam STT] VAD: speech_start")
                             yield {"type": "speech_start"}
 
-                        elif msg_type == "speech_end":
-                            # VAD: user stopped speaking
+                        elif msg_type == "speech_end" or signal_type == "END_SPEECH":
                             print("[Sarvam STT] VAD: speech_end")
                             yield {"type": "speech_end"}
 
