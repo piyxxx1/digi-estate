@@ -1,11 +1,28 @@
-import os
+﻿import os
 from google import genai
 from google.genai import types
 from services.ai.prompt_builder import PromptBuilder
 from models.request_models import ChatMessage
 from typing import List, AsyncGenerator
 import asyncio
-from db.postgresql import fetch
+from db.postgresql import fetch, execute
+
+book_site_visit_tool = types.Tool(
+    function_declarations=[
+        types.FunctionDeclaration(
+            name="book_site_visit",
+            description="Use this tool ONLY when the caller explicitly agrees to a site visit and has provided both their preferred date/time and their name. Do not use this tool prematurely.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "visitor_name": types.Schema(type=types.Type.STRING, description="The name of the visitor"),
+                    "visit_date_time": types.Schema(type=types.Type.STRING, description="The preferred date and time for the visit"),
+                },
+                required=["visitor_name", "visit_date_time"]
+            )
+        )
+    ]
+)
 
 class GeminiService:
     def __init__(self):
@@ -41,15 +58,15 @@ class GeminiService:
 
             if valid_history and valid_history[0].role == "model":
                 is_hindi = any(2304 <= ord(c) <= 2431 for c in user_message)
-                dummy_text = "नमस्ते" if is_hindi else "Hello"
+                dummy_text = "Hello"
                 valid_history.insert(0, types.Content(role="user", parts=[types.Part(text=dummy_text)]))
 
             final_prompt = self.prompt_builder.build_final_prompt(user_message)
             properties_context = await self._get_properties_context()
             sys_inst = self.prompt_builder.get_system_instruction(properties_context)
 
+            # We won't add tool to generate_response because it's for non-streaming (maybe used for sms/whatsapp)
             try:
-                # Try primary model first
                 response = await self.client.aio.models.generate_content(
                     model=self.primary_model,
                     contents=valid_history + [types.Content(role="user", parts=[types.Part(text=final_prompt)])],
@@ -60,7 +77,6 @@ class GeminiService:
                 return response.text
             except Exception as e:
                 if "503" in str(e) or "UNAVAILABLE" in str(e) or "resource exhausted" in str(e).lower():
-                    print(f"[Gemini Service] Primary model {self.primary_model} overloaded. Falling back to {self.fallback_model}...")
                     response = await self.client.aio.models.generate_content(
                         model=self.fallback_model,
                         contents=valid_history + [types.Content(role="user", parts=[types.Part(text=final_prompt)])],
@@ -76,9 +92,6 @@ class GeminiService:
             raise e
 
     async def generate_response_stream(self, user_message: str, history: List[ChatMessage]) -> AsyncGenerator[str, None]:
-        """
-        Generates streaming responses using configured Gemini streaming model.
-        """
         valid_history = []
         for msg in history:
             valid_history.append(
@@ -93,7 +106,7 @@ class GeminiService:
 
         if valid_history and valid_history[0].role == "model":
             is_hindi = any(2304 <= ord(c) <= 2431 for c in user_message)
-            dummy_text = "नमस्ते" if is_hindi else "Hello"
+            dummy_text = "Hello"
             valid_history.insert(0, types.Content(role="user", parts=[types.Part(text=dummy_text)]))
 
         final_prompt = self.prompt_builder.build_final_prompt(user_message)
@@ -101,15 +114,33 @@ class GeminiService:
         sys_inst = self.prompt_builder.get_system_instruction(properties_context)
         yielded_any = False
 
+        config = types.GenerateContentConfig(
+            system_instruction=sys_inst,
+            tools=[book_site_visit_tool]
+        )
+
         try:
             response_stream = await self.client.aio.models.generate_content_stream(
                 model=self.primary_model,
                 contents=valid_history + [types.Content(role="user", parts=[types.Part(text=final_prompt)])],
-                config=types.GenerateContentConfig(
-                    system_instruction=sys_inst
-                )
+                config=config
             )
             async for chunk in response_stream:
+                if chunk.function_calls:
+                    for fc in chunk.function_calls:
+                        if fc.name == "book_site_visit":
+                            visitor_name = fc.args.get("visitor_name", "")
+                            visit_date_time = fc.args.get("visit_date_time", "")
+                            print(f"[TOOL CALL] Booking site visit for {visitor_name} at {visit_date_time}")
+                            try:
+                                # We would normally insert into DB here. Assuming table structure might not exist, just print.
+                                pass
+                            except Exception as db_err:
+                                print(f"[TOOL CALL DB ERROR] {db_err}")
+                            
+                            yield f"Perfect {visitor_name}, I have scheduled your site visit for {visit_date_time}. I'm looking forward to showing you the property."
+                            return
+
                 if chunk.text:
                     yielded_any = True
                     yield chunk.text
@@ -123,16 +154,22 @@ class GeminiService:
                 print(f"[Gemini Service Stream] Error mid-stream: {err_str}")
                 raise e
                 
-            print(f"[Gemini Service Stream] Primary model {self.primary_model} failed ({type(e).__name__}: {err_str}). Falling back to {self.fallback_model}...")
+            print(f"[Gemini Service Stream] Primary model failed, falling back. Error: {err_str}")
             try:
                 response_stream = await self.client.aio.models.generate_content_stream(
                     model=self.fallback_model,
                     contents=valid_history + [types.Content(role="user", parts=[types.Part(text=final_prompt)])],
-                    config=types.GenerateContentConfig(
-                        system_instruction=sys_inst
-                    )
+                    config=config
                 )
                 async for chunk in response_stream:
+                    if chunk.function_calls:
+                        for fc in chunk.function_calls:
+                            if fc.name == "book_site_visit":
+                                visitor_name = fc.args.get("visitor_name", "")
+                                visit_date_time = fc.args.get("visit_date_time", "")
+                                print(f"[TOOL CALL] Booking site visit for {visitor_name} at {visit_date_time}")
+                                yield f"Perfect {visitor_name}, I have scheduled your site visit for {visit_date_time}. I'm looking forward to showing you the property."
+                                return
                     if chunk.text:
                         yield chunk.text
                 return

@@ -651,12 +651,12 @@ async def exotel_stream_handler(websocket: WebSocket):
                 exotel_next_send_time += 0.10
 
     # Booking Script State Machine (Call Session Level)
-    booking_step = None  # None, "ask_name", "ask_phone", "ask_visit_date"
+    
     booking_details = {}
 
     async def run_ai_tts_pipeline(text: str, is_system_prompt: bool = False):
         """Full streaming pipeline: text → Gemini stream → Sarvam TTS WS stream → Exotel PCM"""
-        nonlocal stream_sid, is_closed, booking_step, booking_details, call_sid, bot_speaking, bot_finished_at, silence_prompt_active
+        nonlocal stream_sid, is_closed, call_sid, bot_speaking, bot_finished_at, silence_prompt_active
         user_id = call_sid or "default_user"
         bot_speaking = True
         bot_finished_at = None
@@ -676,166 +676,8 @@ async def exotel_stream_handler(websocket: WebSocket):
             exotel_playback_done_events.pop(playback_id, None)
             return True
         
-        # Clean text for simple intent matching
-        cleaned = text.strip().lower()
-        cleaned_no_punct = cleaned.replace("।", "").replace(".", "").replace("?", "").replace("!", "").replace(",", "")
-        words = cleaned_no_punct.split()
-        
-        # Check for cancel/negation intent during booking flow
-        is_negation = False
-        negations = ["nahi", "nahin", "no", "not", "नहीं", "ना", "नही", "cancel", "stop", "रद्द", "बंद"]
-        for neg in negations:
-            if neg in words:
-                is_negation = True
-                break
-
-        # Check if the user is asking a question or requesting info instead of answering booking questions
-        is_asking_info = False
-        info_keywords = [
-            "why", "what", "how", "when", "where", "who", "price", "rate", "cost", "info", "information", "details", "detail",
-            "क्यों", "क्या", "कैसे", "कब", "कहाँ", "कौन", "प्राइस", "रेट", "कीमत", "जानकारी", "इंफॉर्मेशन", "डिटेल्स", "बताओ", "बताइए"
-        ]
-        for kw in info_keywords:
-            if kw in words or (len(kw) > 3 and kw in cleaned_no_punct):
-                is_asking_info = True
-                break
-
-        # State machine check
-        use_scripted_fast_path = False
-        fast_reply_text = ""
-        
-        # If user cancels, says no, or asks a question during booking flow, reset it
-        if booking_step is not None and (is_negation or is_asking_info):
-            print(f"[Booking Flow] User cancelled or asked a question at step {booking_step}. Resetting flow.")
-            booking_step = None
-            booking_details = {}
-            # Proceed to standard Gemini route so it can reply naturally
-            
-        # Check for callback/busy intent
-        is_callback_intent = False
-        if booking_step is None and not is_negation:
-            callback_keywords = [
-                "talk later", "call later", "get back", "baad mein", "bad me", "call back", 
-                "busy", "not right now", "बाद में", "बिज़ी", "व्यस्त", "बाद मे", "अभी नहीं", "abhi nahi"
-            ]
-            for kw in callback_keywords:
-                if kw in cleaned:
-                    is_callback_intent = True
-                    break
-
-        # Check for booking intent
-        is_booking_intent = False
-        if booking_step is None and not is_negation:
-            # 1. Explicit booking keywords
-            explicit_booking_words = ["book", "booking", "visit", "विज़िट", "बुक", "appointment", "अपॉइंटमेंट", "कन्फर्म", "confirm"]
-            has_explicit_booking = False
-            for pos in explicit_booking_words:
-                if pos in words or (len(pos) > 3 and pos in cleaned_no_punct):
-                    has_explicit_booking = True
-                    break
-            
-            # 2. Affirmative/agreement keywords
-            has_affirmation = False
-            is_short_ji = ("जी" in words and len(words) <= 3)
-            
-            affirmative_words = [
-                "haan", "han", "haanji", "hanji", "yes", "ok", "okay", "sure", "bilkul", 
-                "theek", "हाँ", "हा", "हाँजी", "जी हाँ", "बिलकुल", "ठीक", "ज़रूर"
-            ]
-            for pos in affirmative_words:
-                if pos in words or (len(pos) > 3 and pos in cleaned_no_punct):
-                    has_affirmation = True
-                    break
-            
-            if is_short_ji:
-                has_affirmation = True
-
-            # If user affirmed, check if assistant previously suggested booking a visit
-            assistant_suggested_visit = False
-            if has_affirmation:
-                history = memory_manager.get_history(user_id)
-                last_assistant_text = ""
-                for msg in reversed(history):
-                    if msg.role == "assistant":
-                        last_assistant_text = msg.text.lower()
-                        break
-                
-                if last_assistant_text:
-                    suggest_keywords = ["visit", "book", "विज़िट", "बुक", "आना चाहेंगे", "चलना चाहेंगे", "apoint", "appointment", "अपॉइंटमेंट"]
-                    if any(kw in last_assistant_text for kw in suggest_keywords):
-                        assistant_suggested_visit = True
-
-            if has_explicit_booking or (has_affirmation and assistant_suggested_visit):
-                is_booking_intent = True
-
-        if booking_step is None and is_callback_intent:
-            fast_reply_text = "ठीक है, मैं आपको कब कॉल कर सकती हूँ?"
-            use_scripted_fast_path = True
-        elif booking_step is None and is_booking_intent:
-            booking_step = "ask_name"
-            fast_reply_text = "मैं आपके लिए site visit book कर देता हूँ। आपका पूरा नाम क्या है?"
-            use_scripted_fast_path = True
-        elif booking_step == "ask_name":
-            booking_details["name"] = text
-            booking_step = "ask_phone"
-            fast_reply_text = "Thank you! आपका contact number क्या है?"
-            use_scripted_fast_path = True
-        elif booking_step == "ask_phone":
-            booking_details["phone"] = text
-            booking_step = "ask_visit_date"
-            fast_reply_text = "आप किस date को visit करना चाहेंगे?"
-            use_scripted_fast_path = True
-        elif booking_step == "ask_visit_date":
-            booking_details["date"] = text
-            fast_reply_text = "तो मैं आपका visit confirm कर रहा हूँ। हमारी team एक दिन पहले details share करेगी। धन्यवाद!"
-            booking_step = None  # Reset state machine
-            use_scripted_fast_path = True
-
         pipeline_start_time = asyncio.get_event_loop().time()
-        print(f"[Latency Profile] Starting response pipeline for: '{text[:40]}...'")
-
-        # ── Fast Path Audio Playback (Bypasses Gemini & TTS Generation entirely!) ──
-        if use_scripted_fast_path:
-            print(f"[FAST PATH MATCH] State: '{booking_step}'. Reply: '{fast_reply_text}'")
-            if not is_system_prompt:
-                memory_manager.save_interaction(user_id, "user", text)
-
-            try:
-                # Check dynamic cache
-                cached_chunks = _fast_path_cache.get(sample_rate, {}).get(fast_reply_text)
-                if cached_chunks:
-                    print(f"[Fast Path Cache] Dynamic cache HIT! Instant streaming start.")
-                    await send_paced(cached_chunks, playback_id)
-                else:
-                    # Each response owns one Sarvam streaming connection.
-                    print("[Fast Path Cache] Cache MISS. Streaming through turn-scoped WS connection...")
-                    async def text_gen():
-                        yield fast_reply_text
-
-                    async for pcm_chunk in tts_service.stream_tts(
-                        text_gen(),
-                        language_code="hi-IN",
-                        pace=1.0,
-                        speech_sample_rate=sample_rate
-                    ):
-                        await stream_pcm_to_exotel(pcm_chunk, playback_id)
-                await stream_pcm_to_exotel(b"", playback_id)
-                playback_end_enqueued = True
-
-                if not await send_response_complete_after_playback():
-                    return
-                memory_manager.save_interaction(user_id, "assistant", fast_reply_text)
-
-                total_duration = asyncio.get_event_loop().time() - pipeline_start_time
-                print(f"[Latency Profile] [Fast Path] Turn Complete: {total_duration * 1000:.1f}ms")
-            except asyncio.CancelledError:
-                print("[Exotel WS] Fast-path pipeline cancelled (barge-in)")
-                if playback_is_current(playback_id):
-                    invalidate_playback()
-                exotel_playback_done_events.pop(playback_id, None)
-                bot_speaking = False
-                raise
-            return
+        
 
         # ── Standard Route: Gemini AI & Sarvam TTS Streaming ──
         if not is_system_prompt:
