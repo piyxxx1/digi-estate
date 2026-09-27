@@ -1,4 +1,4 @@
-﻿import os
+import os
 from google import genai
 from google.genai import types
 from services.ai.prompt_builder import PromptBuilder
@@ -20,6 +20,15 @@ book_site_visit_tool = types.Tool(
                 },
                 required=["visitor_name", "visit_date_time"]
             )
+        )
+    ]
+)
+
+hang_up_tool = types.Tool(
+    function_declarations=[
+        types.FunctionDeclaration(
+            name="hang_up",
+            description="Use this tool when the conversation is over and the call should be disconnected.",
         )
     ]
 )
@@ -116,7 +125,7 @@ class GeminiService:
 
         config = types.GenerateContentConfig(
             system_instruction=sys_inst,
-            tools=[book_site_visit_tool]
+            tools=[book_site_visit_tool, hang_up_tool]
         )
 
         try:
@@ -139,6 +148,10 @@ class GeminiService:
                                 print(f"[TOOL CALL DB ERROR] {db_err}")
                             
                             yield f"Perfect {visitor_name}, I have scheduled your site visit for {visit_date_time}. I'm looking forward to showing you the property."
+                            return
+                        elif fc.name == "hang_up":
+                            print(f"[TOOL CALL] Hanging up the call")
+                            yield "hang_up"
                             return
 
                 if chunk.text:
@@ -169,6 +182,10 @@ class GeminiService:
                                 visit_date_time = fc.args.get("visit_date_time", "")
                                 print(f"[TOOL CALL] Booking site visit for {visitor_name} at {visit_date_time}")
                                 yield f"Perfect {visitor_name}, I have scheduled your site visit for {visit_date_time}. I'm looking forward to showing you the property."
+                                return
+                            elif fc.name == "hang_up":
+                                print(f"[TOOL CALL] Hanging up the call (fallback)")
+                                yield "hang_up"
                                 return
                     if chunk.text:
                         yield chunk.text

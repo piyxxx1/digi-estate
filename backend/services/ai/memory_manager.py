@@ -44,7 +44,7 @@ class MemoryManager:
                     return
 
             await execute("""
-                INSERT INTO conversations (user_id, phone_number, role, message, call_sid)
+                INSERT INTO conversations (user_id, phone_number, role, message)
                 VALUES ($1, $2, $3, $4, $5)
             """, db_user_id, lead_phone, role, message, call_sid)
         except Exception as e:

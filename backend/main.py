@@ -30,7 +30,7 @@ async def lifespan(app: FastAPI):
     # Eagerly pre-cache greeting audio at 8000Hz on startup (matching telephony standard)
     from api.websocket.exotel_ws import _ensure_greeting_cached
     print("[Startup] Eagerly pre-caching greeting audio at 8000Hz...")
-    asyncio.create_task(_ensure_greeting_cached(8000))
+    asyncio.create_task(_ensure_greeting_cached(16000))
     
     # Eagerly initialize asyncpg pool
     print("[Startup] Initializing PostgreSQL connection pool...")
@@ -71,4 +71,3 @@ async def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-

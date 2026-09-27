@@ -688,14 +688,20 @@ async def exotel_stream_handler(websocket: WebSocket):
             print(f"  - {m.role}: {m.text}")
         gemini_history = history[:-1] if len(history) > 0 else []
         full_response = ""
+        should_hang_up = False
         
         first_gemini_token_time = None
         first_audio_chunk_time = None
 
         try:
             async def gemini_text_generator():
-                nonlocal full_response, first_gemini_token_time
+                nonlocal full_response, first_gemini_token_time, should_hang_up
                 async for chunk_text in ai_service.generate_response_stream(text, gemini_history):
+                    if chunk_text == "hang_up":
+                        should_hang_up = True
+                        print("[Exotel WS] Received hang_up signal from Gemini")
+                        break
+                        
                     if first_gemini_token_time is None:
                         first_gemini_token_time = asyncio.get_event_loop().time()
                         ttft = first_gemini_token_time - pipeline_start_time
@@ -780,6 +786,11 @@ async def exotel_stream_handler(websocket: WebSocket):
             total_duration = asyncio.get_event_loop().time() - pipeline_start_time
             print(f"[Latency Profile] Complete turn execution time: {total_duration * 1000:.1f}ms")
             print(f"[Exotel WS] Streaming response complete: {full_response[:80]}...")
+            
+            if should_hang_up:
+                print(f"[Exotel WS] Disconnecting call {call_sid} due to hang_up tool")
+                await websocket.close()
+                return
 
         except asyncio.CancelledError:
             print("[Exotel WS] run_ai_tts_pipeline cancelled (barge-in)")
@@ -800,6 +811,11 @@ async def exotel_stream_handler(websocket: WebSocket):
             total_duration = asyncio.get_event_loop().time() - pipeline_start_time
             print(f"[Latency Profile] Complete turn execution time: {total_duration * 1000:.1f}ms")
             print(f"[Exotel WS] Streaming response complete: {full_response[:80]}...")
+            
+            if should_hang_up:
+                print(f"[Exotel WS] Disconnecting call {call_sid} due to hang_up tool")
+                await websocket.close()
+                return
 
     async def process_after_silence():
         nonlocal latest_transcript, last_transcript_time, stream_sid, is_closed, response_task, user_currently_speaking, bot_finished_at, silence_prompt_active
