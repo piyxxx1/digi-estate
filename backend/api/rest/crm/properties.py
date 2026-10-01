@@ -1,100 +1,164 @@
-from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel, Field
-from db.postgresql import fetch, fetchrow, execute
+from fastapi import APIRouter, HTTPException, status, Depends, BackgroundTasks
 from typing import List, Optional
+from uuid import UUID
+import json
+from datetime import datetime
+
+from db.postgresql import fetch, fetchrow, execute
+from models.property_models import PropertyCreateRequest, PropertyUpdateRequest, PropertyOut, PropertyReviewConfirmRequest
+from api.rest.crm.auth.auth import get_current_user
+from services.property_ingestion import ingest_property, embed_and_publish_property
 
 router = APIRouter()
 
-# --- Pydantic Schema Definitions ---
-class PropertyCreate(BaseModel):
-    property_heading: str
-    description: str = Field(..., alias="property_details")
-    user_id: str
-
-    class Config:
-        populate_by_name = True
-
-class PropertyOut(BaseModel):
-    id: int
-    property_heading: Optional[str] = None
-    property_details: str
-    user_id: Optional[str] = None
-
-# --- Endpoints ---
+def parse_property_row(row: dict) -> dict:
+    row = dict(row)
+    if isinstance(row.get('unit_types'), str):
+        row['unit_types'] = json.loads(row['unit_types'])
+    if isinstance(row.get('facts'), str):
+        row['facts'] = json.loads(row['facts'])
+    if isinstance(row.get('extraction_warnings'), str):
+        row['extraction_warnings'] = json.loads(row['extraction_warnings'])
+    return row
 
 @router.get("/properties", response_model=List[PropertyOut])
-async def get_properties(user_id: Optional[str] = None):
-    """
-    Fetches listed properties, optionally filtering by user_id.
-    """
+async def list_properties(current_user: dict = Depends(get_current_user)):
+    dealer_id = UUID(str(current_user['dealer_id']))
     try:
-        if user_id is not None:
-            rows = await fetch("SELECT id, property_heading, property_details, user_id FROM property WHERE user_id = $1 OR user_id IS NULL ORDER BY id ASC;", user_id)
-        else:
-            rows = await fetch("SELECT id, property_heading, property_details, user_id FROM property ORDER BY id ASC;")
-        return [dict(row) for row in rows]
+        rows = await fetch("SELECT * FROM properties WHERE dealer_id = $1 ORDER BY created_at DESC;", dealer_id)
+        return [parse_property_row(r) for r in rows]
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to fetch properties: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/properties", response_model=PropertyOut, status_code=status.HTTP_201_CREATED)
-async def create_property(payload: PropertyCreate):
-    """
-    Inserts a new property associated with a user into the database.
-    """
+async def create_property(
+    payload: PropertyCreateRequest, 
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user)
+):
+    dealer_id = UUID(str(current_user['dealer_id']))
+    prop_status = 'processing' if payload.raw_text else 'draft'
     try:
-        query = "INSERT INTO property (property_heading, property_details, user_id) VALUES ($1, $2, $3) RETURNING id, property_heading, property_details, user_id;"
-        row = await fetchrow(query, payload.property_heading, payload.description, payload.user_id)
-        return dict(row)
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to save property: {str(e)}"
+        row = await fetchrow(
+            """
+            INSERT INTO properties (dealer_id, name, aliases, city, region, property_type, unit_types, facts, raw_text, status)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            RETURNING *;
+            """,
+            dealer_id,
+            payload.name,
+            payload.aliases,
+            payload.city,
+            payload.region,
+            payload.property_type,
+            json.dumps([u.model_dump() for u in payload.unit_types]),
+            json.dumps(payload.facts),
+            payload.raw_text,
+            prop_status
         )
+        
+        prop_id = str(row['property_id'])
+        if payload.raw_text:
+            background_tasks.add_task(ingest_property, prop_id, str(dealer_id), payload.raw_text)
+            
+        return parse_property_row(row)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-@router.delete("/properties/{property_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_property(property_id: int):
-    """
-    Removes a property listing from the database by ID.
-    """
-    try:
-        exists = await fetchrow("SELECT id FROM property WHERE id = $1;", property_id)
-        if not exists:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Property with ID {property_id} not found."
-            )
-        await execute("DELETE FROM property WHERE id = $1;", property_id)
-        return None
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to delete property: {str(e)}"
-        )
+@router.get("/properties/{property_id}", response_model=PropertyOut)
+async def get_property(property_id: UUID, current_user: dict = Depends(get_current_user)):
+    dealer_id = UUID(str(current_user['dealer_id']))
+    row = await fetchrow("SELECT * FROM properties WHERE property_id = $1 AND dealer_id = $2;", property_id, dealer_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Property not found")
+    return parse_property_row(row)
 
 @router.put("/properties/{property_id}", response_model=PropertyOut)
-async def update_property(property_id: int, payload: PropertyCreate):
-    """
-    Updates an existing property's details and user association.
-    """
+async def update_property(
+    property_id: UUID, 
+    payload: PropertyUpdateRequest,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user)
+):
+    dealer_id = UUID(str(current_user['dealer_id']))
+    existing = await fetchrow("SELECT * FROM properties WHERE property_id = $1 AND dealer_id = $2;", property_id, dealer_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Property not found")
+        
+    updates = []
+    values = []
+    idx = 1
+    
+    trigger_ingestion = False
+    payload_dict = payload.model_dump(exclude_unset=True)
+    
+    # Trigger ingestion if raw_text changed, or if it failed previously
+    if 'raw_text' in payload_dict:
+        if payload_dict['raw_text'] != existing['raw_text'] or existing['status'] == 'failed':
+            trigger_ingestion = True
+            payload_dict['status'] = 'reindexing' if existing['status'] != 'failed' else 'processing'
+        
+    for k, v in payload_dict.items():
+        if k in ['unit_types', 'facts']:
+            v = json.dumps([i.model_dump() if hasattr(i, 'model_dump') else i for i in v]) if k == 'unit_types' else json.dumps(v)
+        updates.append(f"{k} = ${idx}")
+        values.append(v)
+        idx += 1
+        
+    updates.append(f"updated_at = NOW()")
+    values.append(property_id)
+    values.append(dealer_id)
+    
+    query = f"UPDATE properties SET {', '.join(updates)} WHERE property_id = ${idx} AND dealer_id = ${idx+1} RETURNING *;"
+    
     try:
-        exists = await fetchrow("SELECT id FROM property WHERE id = $1;", property_id)
-        if not exists:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Property with ID {property_id} not found."
-            )
-        query = "UPDATE property SET property_heading = $1, property_details = $2, user_id = $3 WHERE id = $4 RETURNING id, property_heading, property_details, user_id;"
-        row = await fetchrow(query, payload.property_heading, payload.description, payload.user_id, property_id)
-        return dict(row)
-    except HTTPException:
-        raise
+        updated_row = await fetchrow(query, *values)
+        if trigger_ingestion and updated_row['raw_text']:
+            background_tasks.add_task(ingest_property, str(property_id), str(dealer_id), updated_row['raw_text'])
+        return parse_property_row(updated_row)
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to update property: {str(e)}"
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/properties/{property_id}/confirm", response_model=PropertyOut)
+async def confirm_property(
+    property_id: UUID, 
+    payload: PropertyReviewConfirmRequest,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user)
+):
+    dealer_id = UUID(str(current_user['dealer_id']))
+    existing = await fetchrow("SELECT * FROM properties WHERE property_id = $1 AND dealer_id = $2;", property_id, dealer_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Property not found")
+        
+    # Update facts/unit_types first, clear warnings, keep status needs_review until chunks are ready
+    try:
+        updated_row = await fetchrow(
+            """
+            UPDATE properties 
+            SET unit_types = $1, facts = $2, extraction_warnings = '[]'::jsonb
+            WHERE property_id = $3 AND dealer_id = $4
+            RETURNING *;
+            """,
+            json.dumps([u.model_dump() for u in payload.unit_types]),
+            json.dumps(payload.facts),
+            property_id,
+            dealer_id
         )
+        # trigger embed
+        background_tasks.add_task(embed_and_publish_property, str(property_id), str(dealer_id))
+        return parse_property_row(updated_row)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.delete("/properties/{property_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_property(property_id: UUID, current_user: dict = Depends(get_current_user)):
+    dealer_id = UUID(str(current_user['dealer_id']))
+    existing = await fetchrow("SELECT property_id FROM properties WHERE property_id = $1 AND dealer_id = $2;", property_id, dealer_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Property not found")
+        
+    try:
+        await execute("DELETE FROM properties WHERE property_id = $1 AND dealer_id = $2;", property_id, dealer_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

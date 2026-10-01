@@ -1,0 +1,1 @@
+ALTER TABLE users ADD COLUMN IF NOT EXISTS dealer_id UUID DEFAULT gen_random_uuid() UNIQUE;

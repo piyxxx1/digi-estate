@@ -61,19 +61,29 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         user_id: str = payload.get("sub")
+        dealer_id: str = payload.get("dealer_id")
         if user_id is None:
             raise credentials_exception
     except jwt.PyJWTError:
         raise credentials_exception
         
-    user = await fetchrow("SELECT user_id, business_name, exotel_virtual_number FROM users WHERE user_id = $1;", user_id)
+    user = await fetchrow("SELECT user_id, dealer_id, business_name, exotel_virtual_number FROM users WHERE user_id = $1;", user_id)
     if user is None:
         raise credentials_exception
-    return dict(user)
+        
+    user_dict = dict(user)
+    # Ensure dealer_id is string if from token fallback
+    if 'dealer_id' not in user_dict or not user_dict['dealer_id']:
+        user_dict['dealer_id'] = dealer_id
+    else:
+        user_dict['dealer_id'] = str(user_dict['dealer_id'])
+        
+    return user_dict
 
 class UserLogin(BaseModel):
     user_id: str
     password: str
+    client_id: str
 
 class Token(BaseModel):
     access_token: str
@@ -83,9 +93,11 @@ class Token(BaseModel):
 
 class RefreshTokenReq(BaseModel):
     refresh_token: str
+    client_id: str
 
 class RefreshTokenRes(BaseModel):
     access_token: str
+    refresh_token: str
     token_type: str
 
 @router.post("/login", response_model=Token)
@@ -94,7 +106,7 @@ async def login_user(payload: UserLogin):
     Logs in a user by their email-based user_id and password.
     """
     try:
-        query = "SELECT user_id, business_name, password FROM users WHERE user_id = $1;"
+        query = "SELECT user_id, dealer_id, business_name, password FROM users WHERE user_id = $1;"
         user = await fetchrow(query, payload.user_id.strip())
         
         if not user or not verify_password(payload.password, user.get('password')):
@@ -105,7 +117,7 @@ async def login_user(payload: UserLogin):
             
         access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
         access_token = create_access_token(
-            data={"sub": user["user_id"]}, expires_delta=access_token_expires
+            data={"sub": user["user_id"], "dealer_id": str(user["dealer_id"])}, expires_delta=access_token_expires
         )
         refresh_token = create_refresh_token(data={"sub": user["user_id"]})
         
@@ -114,10 +126,10 @@ async def login_user(payload: UserLogin):
         expires_at = datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
         await execute(
             """
-            INSERT INTO refresh_tokens (user_id, token_hash, expires_at)
-            VALUES ($1, $2, $3)
+            INSERT INTO refresh_tokens (user_id, token_hash, expires_at, client_id, last_used_at)
+            VALUES ($1, $2, $3, $4, NOW())
             """,
-            user["user_id"], token_hash, expires_at
+            user["user_id"], token_hash, expires_at, payload.client_id
         )
         
         user_data = dict(user)
@@ -160,27 +172,47 @@ async def refresh_token(payload: RefreshTokenReq):
         token_hash = hashlib.sha256(payload.refresh_token.encode()).hexdigest()
         db_token = await fetchrow(
             """
-            SELECT revoked, expires_at 
+            SELECT expires_at, client_id 
             FROM refresh_tokens 
             WHERE token_hash = $1 AND user_id = $2
             """,
             token_hash, user_id
         )
         
-        if not db_token or db_token["revoked"] or db_token["expires_at"] < datetime.utcnow():
+        if not db_token or db_token["expires_at"].replace(tzinfo=None) < datetime.utcnow():
             raise credentials_exception
             
-        # Optional: check if user still exists (handled largely by foreign key, but good to be safe)
-        user = await fetchrow("SELECT user_id FROM users WHERE user_id = $1;", user_id)
+        # Optionally verify client_id matches
+        if db_token["client_id"] and db_token["client_id"] != payload.client_id:
+            raise credentials_exception
+            
+        # Optional: check if user still exists
+        user = await fetchrow("SELECT user_id, dealer_id FROM users WHERE user_id = $1;", user_id)
         if not user:
             raise credentials_exception
             
+        # Delete old refresh token
+        await execute("DELETE FROM refresh_tokens WHERE token_hash = $1", token_hash)
+            
+        # Issue new tokens
         access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
         access_token = create_access_token(
-            data={"sub": user_id}, expires_delta=access_token_expires
+            data={"sub": user["user_id"], "dealer_id": str(user["dealer_id"])}, expires_delta=access_token_expires
+        )
+        new_refresh_token = create_refresh_token(data={"sub": user["user_id"]})
+        
+        new_token_hash = hashlib.sha256(new_refresh_token.encode()).hexdigest()
+        expires_at = datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+        
+        await execute(
+            """
+            INSERT INTO refresh_tokens (user_id, token_hash, expires_at, client_id, last_used_at)
+            VALUES ($1, $2, $3, $4, NOW())
+            """,
+            user["user_id"], new_token_hash, expires_at, payload.client_id
         )
         
-        return {"access_token": access_token, "token_type": "bearer"}
+        return {"access_token": access_token, "refresh_token": new_refresh_token, "token_type": "bearer"}
         
     except jwt.PyJWTError:
         raise credentials_exception

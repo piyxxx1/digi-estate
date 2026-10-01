@@ -45,8 +45,8 @@ class MemoryManager:
 
             await execute("""
                 INSERT INTO conversations (user_id, phone_number, role, message)
-                VALUES ($1, $2, $3, $4, $5)
-            """, db_user_id, lead_phone, role, message, call_sid)
+                VALUES ($1, $2, $3, $4)
+            """, db_user_id, lead_phone, role, message)
         except Exception as e:
             print(f"[Memory Manager] DB Error inserting into conversations: {e}")
 

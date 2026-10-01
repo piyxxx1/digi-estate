@@ -27,10 +27,11 @@ from db.postgresql import get_pool, close_pool
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Eagerly pre-cache greeting audio at 8000Hz on startup (matching telephony standard)
-    from api.websocket.exotel_ws import _ensure_greeting_cached
-    print("[Startup] Eagerly pre-caching greeting audio at 8000Hz...")
+    # Eagerly pre-cache greeting audio on startup (matching telephony standard)
+    from api.websocket.exotel_ws import _ensure_greeting_cached, _ensure_short_fillers_cached
+    print("[Startup] Eagerly pre-caching greeting audio at 16000Hz...")
     asyncio.create_task(_ensure_greeting_cached(16000))
+    asyncio.create_task(_ensure_short_fillers_cached(16000))
     
     # Eagerly initialize asyncpg pool
     print("[Startup] Initializing PostgreSQL connection pool...")
