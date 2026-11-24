@@ -159,7 +159,7 @@ async def _ensure_greeting_cached(sample_rate: int):
             async for pcm_chunk in tts_service.stream_tts(
                 _mock_text_stream(),
                 language_code="hi-IN",
-                pace=1.2,
+                pace=1.0,
                 speech_sample_rate=sample_rate
             ):
                 audio_bytes_array.extend(pcm_chunk)
@@ -896,7 +896,7 @@ async def exotel_stream_handler(websocket: WebSocket):
             async for pcm_chunk in tts_service.stream_tts(
                 chunk_for_tts(logged_gemini_generator()),
                 language_code="hi-IN",
-                pace=1.2,
+                pace=1.0,
                 speech_sample_rate=sample_rate,
                 pipeline_start_time=pipeline_start_time
             ):

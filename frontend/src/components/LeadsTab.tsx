@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { PhoneCall, Plus, Trash2, History } from 'lucide-react';
 import type { Lead } from '../types';
 import { HistoryModal } from './HistoryModal';
+import { authFetch } from '../utils/api';
 
 interface LeadsTabProps {
   currentUser: { user_id: string; business_name: string };
@@ -49,12 +50,12 @@ export function LeadsTab({
     }
 
     try {
-      const propResponse = await fetch(`${API_BASE_URL}/api/properties?user_id=${currentUser.user_id}`);
+      const propResponse = await authFetch(`${API_BASE_URL}/api/properties?user_id=${currentUser.user_id}`);
       if (propResponse.ok) {
         const propData = await propResponse.json();
         const mappedProps = propData.map((p: any) => ({
-          id: p.id,
-          heading: p.property_heading || `Property #${p.id}`
+          id: p.id || p.property_id,
+          heading: p.name || p.property_heading || `Property #${p.id || p.property_id}`
         }));
         setProperties(mappedProps);
         if (mappedProps.length > 0 && !newInterest) {

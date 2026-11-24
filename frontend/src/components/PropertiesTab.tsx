@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { Plus, Trash2, Edit2 } from 'lucide-react';
 import type { Property } from '../types';
+import { authFetch } from '../utils/api';
 
 interface PropertiesTabProps {
   currentUser: { user_id: string; business_name: string };
@@ -25,18 +26,18 @@ export function PropertiesTab({ currentUser, searchQuery, refreshTrigger }: Prop
   const loadProperties = useCallback(async () => {
     if (!currentUser) return;
     try {
-      const response = await fetch(`${API_BASE_URL}/api/properties?user_id=${currentUser.user_id}`);
+      const response = await authFetch(`${API_BASE_URL}/api/properties?user_id=${currentUser.user_id}`);
       if (response.ok) {
         const data = await response.json();
         const mapped = data.map((item: any, idx: number) => ({
-          id: item.id,
+          id: item.id || item.property_id,
           sequence: idx + 1,
-          name: `Property #${idx + 1}`,
-          property_heading: item.property_heading || `Property #${idx + 1}`,
-          type: "Listing",
+          name: item.name || `Property #${idx + 1}`,
+          property_heading: item.name || item.property_heading || `Property #${idx + 1}`,
+          type: item.property_type || "Listing",
           price: "On Request",
-          location: "Lansdowne",
-          description: item.property_details,
+          location: item.city || "Lansdowne",
+          description: item.raw_text || item.property_details || (item.facts ? JSON.stringify(item.facts) : ""),
           status: "Available"
         }));
         setProperties(mapped);
@@ -54,10 +55,18 @@ export function PropertiesTab({ currentUser, searchQuery, refreshTrigger }: Prop
   const handleAddProperty = async (heading: string, description: string) => {
     if (!currentUser) return;
     try {
-      const response = await fetch(`${API_BASE_URL}/api/properties`, {
+      const response = await authFetch(`${API_BASE_URL}/api/properties`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ property_heading: heading, property_details: description, user_id: currentUser.user_id })
+        body: JSON.stringify({ 
+          name: heading,
+          property_type: "Residential",
+          city: "Delhi",
+          raw_text: description,
+          property_heading: heading, 
+          property_details: description, 
+          user_id: currentUser.user_id 
+        })
       });
       if (response.ok) {
         await loadProperties();
@@ -70,10 +79,10 @@ export function PropertiesTab({ currentUser, searchQuery, refreshTrigger }: Prop
   };
 
   // Property removal handler
-  const handleDeleteProperty = async (id: number) => {
+  const handleDeleteProperty = async (id: number | string) => {
     if (confirm("Are you sure you want to remove this property?")) {
       try {
-        const response = await fetch(`${API_BASE_URL}/api/properties/${id}`, {
+        const response = await authFetch(`${API_BASE_URL}/api/properties/${id}`, {
           method: "DELETE"
         });
         if (response.ok) {
@@ -88,13 +97,19 @@ export function PropertiesTab({ currentUser, searchQuery, refreshTrigger }: Prop
   };
 
   // Property editing handler
-  const handleEditProperty = async (id: number, heading: string, description: string) => {
+  const handleEditProperty = async (id: number | string, heading: string, description: string) => {
     if (!currentUser) return;
     try {
-      const response = await fetch(`${API_BASE_URL}/api/properties/${id}`, {
+      const response = await authFetch(`${API_BASE_URL}/api/properties/${id}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ property_heading: heading, property_details: description, user_id: currentUser.user_id })
+        body: JSON.stringify({ 
+          name: heading,
+          raw_text: description,
+          property_heading: heading, 
+          property_details: description, 
+          user_id: currentUser.user_id 
+        })
       });
       if (response.ok) {
         await loadProperties();

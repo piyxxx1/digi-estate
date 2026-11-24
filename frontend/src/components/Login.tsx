@@ -25,7 +25,7 @@ export function Login({ onLogin, onBackToLanding }: LoginProps) {
       const response = await fetch(`${API_BASE_URL}/api/auth/login`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ user_id: userId.trim(), password })
+        body: JSON.stringify({ user_id: userId.trim(), password, client_id: "web-crm" })
       });
       
       if (response.ok) {
@@ -48,9 +48,14 @@ export function Login({ onLogin, onBackToLanding }: LoginProps) {
   return (
     <div className="login-container">
       <div className="login-card">
-        <div className="login-header">
+        <div className="login-header" style={{ textAlign: 'center' }}>
+          <img 
+            src="/logo.webp" 
+            alt="Digital Estate Logo" 
+            style={{ width: '64px', height: '64px', objectFit: 'contain', margin: '0 auto 12px auto', display: 'block' }}
+          />
           <h2>Welcome Back</h2>
-          <p>Sign in to access your CRM</p>
+          <p>Sign in to Digital Estate CRM</p>
         </div>
         
         {error && <div className="login-error">{error}</div>}

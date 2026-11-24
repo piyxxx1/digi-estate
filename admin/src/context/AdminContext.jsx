@@ -16,7 +16,7 @@ export const useAdmin = () => {
 };
 
 export const AdminProvider = ({ children }) => {
-  const { metrics, setMetrics } = useMetrics();
+  const { metrics, setMetrics, companyUsage, telemetryRaw, isLoadingTelemetry, refreshTelemetry } = useMetrics();
   const { agents, updateAgent } = useAgents();
   const { 
     crmUsers, 
@@ -38,6 +38,7 @@ export const AdminProvider = ({ children }) => {
   return (
     <AdminContext.Provider value={{
       metrics, setMetrics,
+      companyUsage, telemetryRaw, isLoadingTelemetry, refreshTelemetry,
       crmUsers, addCrmUser, deleteCrmUser, updateCrmUser,
       leads, setLeads, addLead, deleteLead, assignLeads,
       calls, triggerCall, isLoadingCalls,

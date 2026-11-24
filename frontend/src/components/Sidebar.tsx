@@ -17,9 +17,16 @@ export function Sidebar({ businessName, onLogout }: SidebarProps) {
 
   return (
     <aside className="crm-sidebar">
-      <div className="crm-sidebar-logo">
-        <PhoneCall className="crm-logo-icon" />
-        <h1>DigiCRM</h1>
+      <div className="crm-sidebar-logo" style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+        <img 
+          src="/logo.webp" 
+          alt="Digital Estate Logo" 
+          style={{ width: '36px', height: '36px', objectFit: 'contain' }}
+        />
+        <div style={{ display: 'flex', flexDirection: 'column' }}>
+          <h1 style={{ margin: 0, fontSize: '1.1rem', fontWeight: 700, lineHeight: 1.2 }}>Digital Estate</h1>
+          <span style={{ fontSize: '0.72rem', color: '#9ca3af', letterSpacing: '0.5px' }}>CRM Portal</span>
+        </div>
       </div>
 
       <nav className="crm-menu">

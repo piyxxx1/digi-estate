@@ -16,7 +16,7 @@ class SarvamTTSService:
     def __init__(self):
         self.api_key = os.getenv("SARVAM_API_KEY")
         self.ws_url = "wss://api.sarvam.ai/text-to-speech/ws"
-        self.model = "bulbul:v3"
+        self.model = "bulbul:v4-flash"
 
     async def stream_tts(
         self,

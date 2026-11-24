@@ -5,11 +5,18 @@ import { LayoutDashboard, UserCheck, History, Sliders, PhoneCall, Bot, LayoutGri
 const Sidebar = () => {
   return (
     <aside className="sidebar">
-      <div className="sidebar-logo">
-        <div className="logo-icon-wrapper">
-          <LayoutGrid size={18} />
+      <div className="sidebar-logo" style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+        <img 
+          src="/logo.webp" 
+          alt="Digital Estate Logo" 
+          style={{ width: '36px', height: '36px', objectFit: 'contain' }}
+        />
+        <div style={{ display: 'flex', flexDirection: 'column' }}>
+          <h1 className="sidebar-text" style={{ margin: 0, fontSize: '1.05rem', fontWeight: 700, lineHeight: 1.2 }}>
+            Digital Estate <span style={{ color: 'var(--zoho-blue)' }}>Admin</span>
+          </h1>
+          <span style={{ fontSize: '0.72rem', color: 'var(--text-muted, #9ca3af)', letterSpacing: '0.5px' }}>Management Suite</span>
         </div>
-        <h1 className="sidebar-text">AI Caller <span style={{ color: 'var(--zoho-blue)' }}>Admin</span></h1>
       </div>
 
       <nav className="sidebar-nav">

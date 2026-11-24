@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Users, Briefcase, PhoneCall, Sparkles } from 'lucide-react';
 import type { Lead, Property, CallLog } from '../types';
+import { authFetch } from '../utils/api';
 
 interface DashboardTabProps {
   currentUser: { user_id: string; business_name: string };
@@ -21,23 +22,24 @@ export function DashboardTab({ currentUser, refreshTrigger, onCallLead }: Dashbo
     const fetchData = async () => {
       try {
         // Fetch properties
-        const propRes = await fetch(`${API_BASE_URL}/api/properties?user_id=${currentUser.user_id}`);
+        const propRes = await authFetch(`${API_BASE_URL}/api/properties?user_id=${currentUser.user_id}`);
         if (propRes.ok) {
           const data = await propRes.json();
           setProperties(data.map((item: any, idx: number) => ({
-            id: item.id,
+            id: item.id || item.property_id,
             sequence: idx + 1,
-            name: `Property #${idx + 1}`,
-            type: "Listing",
+            name: item.name || `Property #${idx + 1}`,
+            property_heading: item.name || item.property_heading || `Property #${idx + 1}`,
+            type: item.property_type || "Listing",
             price: "On Request",
-            location: "Lansdowne",
-            description: item.property_details,
+            location: item.city || "Lansdowne",
+            description: item.raw_text || item.property_details || "",
             status: "Available"
           })));
         }
 
         // Fetch leads
-        const leadRes = await fetch(`${API_BASE_URL}/api/leads?user_id=${currentUser.user_id}`);
+        const leadRes = await authFetch(`${API_BASE_URL}/api/leads?user_id=${currentUser.user_id}`);
         if (leadRes.ok) {
           const data = await leadRes.json();
           setLeads(data.map((item: any) => ({
